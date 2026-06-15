@@ -545,8 +545,8 @@ function ExportView({ classes, students, tok }) {
   const safeName = (studentObj?.nome || "studente").replace(/[^a-zA-Z0-9]+/g,"_");
 
   const fetchRows = async () => {
-    const start = month + "-01", end = month + "-31";
-    const p = await sb(`presenze?select=*&studente_id=eq.${stuId}&data=gte.${start}&data=lte.${end}&order=data,fascia`, {}, tok);
+    const { start, endExcl } = monthRange(month);
+    const p = await sb(`presenze?select=*&studente_id=eq.${stuId}&data=gte.${start}&data=lt.${endExcl}&order=data,fascia`, {}, tok);
     return p || [];
   };
 
