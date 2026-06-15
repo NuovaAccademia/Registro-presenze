@@ -117,6 +117,7 @@ function Login({ onLogin }) {
 
   const card = {fontSize:14,padding:"7px 14px",borderRadius:"var(--border-radius-md)",cursor:"pointer",border:"0.5px solid var(--color-border-secondary)",background:"transparent",color:"var(--color-text-primary)"};
   const cardA = {...card,background:"var(--color-background-secondary)",fontWeight:500,border:"0.5px solid var(--color-border-primary)"};
+  const cardBlue = {...card,background:"#1F3864",color:"#fff",fontWeight:500,border:"0.5px solid #1F3864"};
 
   return (
     <div style={{maxWidth:360,margin:"48px auto",padding:"0 16px",fontFamily:"var(--font-sans)",color:"var(--color-text-primary)"}}>
@@ -128,8 +129,8 @@ function Login({ onLogin }) {
 
       <div style={{fontSize:12,color:"var(--color-text-tertiary)",textTransform:"uppercase",letterSpacing:"0.05em",marginBottom:8}}>Ruolo</div>
       <div style={{display:"flex",gap:8,marginBottom:18}}>
-        <button style={ruolo==="docente"?cardA:card} onClick={()=>setRuolo("docente")}>Docente</button>
-        <button style={ruolo==="segreteria"?cardA:card} onClick={()=>setRuolo("segreteria")}>Segreteria</button>
+        <button style={ruolo==="docente"?cardBlue:card} onClick={()=>setRuolo("docente")}>Docente</button>
+        <button style={ruolo==="segreteria"?cardBlue:card} onClick={()=>setRuolo("segreteria")}>Segreteria</button>
       </div>
 
       <div style={{fontSize:12,color:"var(--color-text-tertiary)",textTransform:"uppercase",letterSpacing:"0.05em",marginBottom:8}}>Password</div>
@@ -737,6 +738,7 @@ function StatsView({ cls, clsStudents, date, tok }) {
 
   const b = {fontSize:13,padding:"5px 12px",border:"0.5px solid var(--color-border-secondary)",borderRadius:"var(--border-radius-md)",background:"transparent",cursor:"pointer",color:"var(--color-text-primary)"};
   const bA = {...b,background:"var(--color-background-secondary)",fontWeight:500,border:"0.5px solid var(--color-border-primary)"};
+  const bBlue = {...b,background:"#1F3864",color:"#fff",fontWeight:500,border:"0.5px solid #1F3864"};
   const th = {fontSize:11,color:"var(--color-text-secondary)",fontWeight:400,textTransform:"uppercase",letterSpacing:"0.04em",padding:"8px 12px"};
 
   const labels = { day:"Giorno selezionato", month:"Mese corrente", all:"Tutto lo storico" };
@@ -746,7 +748,7 @@ function StatsView({ cls, clsStudents, date, tok }) {
       <div style={{display:"flex",gap:6,marginBottom:12,alignItems:"center",flexWrap:"wrap"}}>
         <span style={{fontSize:13,color:"var(--color-text-secondary)",marginRight:4}}>Periodo:</span>
         {Object.entries(labels).map(([k,v])=>(
-          <button key={k} style={period===k?bA:b} onClick={()=>setPeriod(k)}>{v}</button>
+          <button key={k} style={period===k?bBlue:b} onClick={()=>setPeriod(k)}>{v}</button>
         ))}
       </div>
       {err && <div style={{fontSize:13,color:"var(--color-text-danger)",marginBottom:10}}>{err}</div>}
