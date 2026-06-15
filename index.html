@@ -1,0 +1,399 @@
+<!DOCTYPE html>
+<html lang="it">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Registro presenze</title>
+<style>
+  :root {
+    --font-sans: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+    --font-mono: ui-monospace, SFMono-Regular, Menlo, monospace;
+    --color-text-primary: #1a1a18;
+    --color-text-secondary: #55534d;
+    --color-text-tertiary: #8a887f;
+    --color-text-danger: #A32D2D;
+    --color-background-primary: #ffffff;
+    --color-background-secondary: #f5f4ef;
+    --color-background-danger: #FCEBEB;
+    --color-border-primary: rgba(0,0,0,0.40);
+    --color-border-secondary: rgba(0,0,0,0.18);
+    --color-border-tertiary: rgba(0,0,0,0.10);
+    --color-border-danger: #F09595;
+    --border-radius-md: 8px;
+    --border-radius-lg: 12px;
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; padding: 0; background: #faf9f5; }
+  body { font-family: var(--font-sans); -webkit-text-size-adjust: 100%; }
+  input[type="date"] { font-family: var(--font-sans); }
+</style>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/react/18.3.1/umd/react.production.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/react-dom/18.3.1/umd/react-dom.production.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/babel-standalone/7.26.2/babel.min.js"></script>
+</head>
+<body>
+<div id="root"></div>
+
+<script type="text/babel">
+const { useState, useEffect, useCallback } = React;
+
+const SUPABASE_URL = "https://esowfbptahnzxbathqzf.supabase.co";
+const SUPABASE_KEY = "sb_publishable_lil3SYpFe57jbIDNgGryNw_a-tU29Cl";
+
+const HOURS = ['08:30','09:30','10:30','11:30','12:30','13:30'];
+const HOUR_END = {'08:30':'09:30','09:30':'10:30','10:30':'11:30','11:30':'12:30','12:30':'13:30','13:30':'14:30'};
+const CYCLE = [null,'presente','assente','ritardo'];
+const ST = {
+  presente: { bg:'#EAF3DE', fg:'#3B6D11', l:'P' },
+  assente:  { bg:'#FCEBEB', fg:'#A32D2D', l:'A' },
+  ritardo:  { bg:'#FAEEDA', fg:'#854F0B', l:'R' },
+};
+
+async function sb(path, opts = {}) {
+  const res = await fetch(`${SUPABASE_URL}/rest/v1/${path}`, {
+    ...opts,
+    headers: {
+      apikey: SUPABASE_KEY,
+      Authorization: `Bearer ${SUPABASE_KEY}`,
+      "Content-Type": "application/json",
+      ...(opts.headers || {}),
+    },
+  });
+  if (!res.ok) throw new Error(`${res.status} ${await res.text()}`);
+  const txt = await res.text();
+  return txt ? JSON.parse(txt) : null;
+}
+
+function Registro() {
+  const [classes, setClasses] = useState([]);
+  const [students, setStudents] = useState([]);
+  const [presenze, setPresenze] = useState([]);
+  const [selCls, setSelCls] = useState(null);
+  const [date, setDate] = useState(new Date().toISOString().split("T")[0]);
+  const [view, setView] = useState("reg");
+  const [loading, setLoading] = useState(true);
+  const [err, setErr] = useState(null);
+  const [newCls, setNewCls] = useState("");
+  const [newStu, setNewStu] = useState("");
+
+  const loadAll = useCallback(async () => {
+    try {
+      setErr(null);
+      const [cls, stu] = await Promise.all([
+        sb("classi?select=*&order=nome"),
+        sb("studenti?select=*&order=nome"),
+      ]);
+      setClasses(cls || []);
+      setStudents(stu || []);
+      setSelCls(prev => prev || (cls && cls.length ? cls[0].id : null));
+    } catch (e) {
+      setErr("Errore di connessione al database: " + e.message);
+    } finally {
+      setLoading(false);
+    }
+  }, []);
+
+  const loadPresenze = useCallback(async () => {
+    try {
+      const p = await sb(`presenze?select=*&data=eq.${date}`);
+      setPresenze(p || []);
+    } catch (e) {
+      setErr("Errore nel caricare le presenze: " + e.message);
+    }
+  }, [date]);
+
+  useEffect(() => { loadAll(); }, [loadAll]);
+  useEffect(() => { loadPresenze(); }, [loadPresenze]);
+
+  const cls = classes.find(c => c.id === selCls);
+  const clsStudents = students.filter(s => s.classe_id === selCls);
+
+  const presKey = (sid, h) => presenze.find(p => p.studente_id === sid && p.fascia === h);
+  const stateOf = (sid, h) => presKey(sid, h)?.stato || null;
+
+  const cycleHour = async (sid, h) => {
+    const cur = stateOf(sid, h);
+    const next = CYCLE[(CYCLE.indexOf(cur) + 1) % CYCLE.length];
+    const existing = presKey(sid, h);
+    setPresenze(prev => {
+      const others = prev.filter(p => !(p.studente_id === sid && p.fascia === h));
+      return next ? [...others, { ...(existing||{}), studente_id: sid, fascia: h, data: date, stato: next }] : others;
+    });
+    try {
+      if (next === null) {
+        if (existing?.id) await sb(`presenze?id=eq.${existing.id}`, { method: "DELETE" });
+      } else {
+        await sb("presenze", {
+          method: "POST",
+          headers: { Prefer: "resolution=merge-duplicates" },
+          body: JSON.stringify({ studente_id: sid, data: date, fascia: h, stato: next }),
+        });
+        loadPresenze();
+      }
+    } catch (e) { setErr("Errore nel salvataggio: " + e.message); loadPresenze(); }
+  };
+
+  const setAll = async (sid, status) => {
+    try {
+      const rows = HOURS.map(h => ({ studente_id: sid, data: date, fascia: h, stato: status }));
+      await sb("presenze", {
+        method: "POST",
+        headers: { Prefer: "resolution=merge-duplicates" },
+        body: JSON.stringify(rows),
+      });
+      loadPresenze();
+    } catch (e) { setErr("Errore: " + e.message); }
+  };
+
+  const addCls = async () => {
+    const nome = newCls.trim(); if (!nome) return;
+    try {
+      const [c] = await sb("classi", { method: "POST", headers: { Prefer: "return=representation" }, body: JSON.stringify({ nome }) });
+      setNewCls(""); await loadAll(); if (c) setSelCls(c.id);
+    } catch (e) { setErr("Errore: " + e.message); }
+  };
+
+  const addStu = async () => {
+    const nome = newStu.trim(); if (!nome || !cls) return;
+    try {
+      await sb("studenti", { method: "POST", body: JSON.stringify({ nome, classe_id: cls.id }) });
+      setNewStu(""); loadAll();
+    } catch (e) { setErr("Errore: " + e.message); }
+  };
+
+  const remCls = async (id) => {
+    try { await sb(`classi?id=eq.${id}`, { method: "DELETE" }); if (selCls===id) setSelCls(null); loadAll(); }
+    catch (e) { setErr("Errore: " + e.message); }
+  };
+
+  const remStu = async (id) => {
+    try { await sb(`studenti?id=eq.${id}`, { method: "DELETE" }); loadAll(); }
+    catch (e) { setErr("Errore: " + e.message); }
+  };
+
+  const b = {fontSize:13,padding:"5px 12px",border:"0.5px solid var(--color-border-secondary)",borderRadius:"var(--border-radius-md)",background:"transparent",cursor:"pointer",color:"var(--color-text-primary)"};
+  const bA = {...b,background:"var(--color-background-secondary)",fontWeight:500,border:"0.5px solid var(--color-border-primary)"};
+  const inp = {fontSize:13,padding:"5px 10px",border:"0.5px solid var(--color-border-secondary)",borderRadius:"var(--border-radius-md)",background:"transparent",color:"var(--color-text-primary)",outline:"none"};
+  const th = {fontSize:11,color:"var(--color-text-secondary)",fontWeight:400,textTransform:"uppercase",letterSpacing:"0.04em",padding:"8px 4px",textAlign:"center"};
+
+  return (
+    <div style={{fontFamily:"var(--font-sans)",color:"var(--color-text-primary)",maxWidth:720,margin:"0 auto",padding:"12px 16px"}}>
+      <div style={{display:"flex",alignItems:"center",gap:8,marginBottom:16,flexWrap:"wrap"}}>
+        <span style={{fontWeight:500,fontSize:18,flex:1}}>Registro presenze</span>
+        <span style={{fontSize:11,color:"var(--color-text-tertiary)",display:"flex",alignItems:"center",gap:4}}>
+          <span style={{width:7,height:7,borderRadius:"50%",background:err?"#E24B4A":"#639922",display:"inline-block"}}></span>
+          {err ? "offline" : "online"}
+        </span>
+        <input type="date" value={date} onChange={e=>setDate(e.target.value)} style={{...inp,width:"auto"}} />
+        <button style={view==="reg"?bA:b} onClick={()=>setView("reg")}>Registro</button>
+        <button style={view==="stats"?bA:b} onClick={()=>setView("stats")}>Storico</button>
+        <button style={view==="manage"?bA:b} onClick={()=>setView("manage")}>Gestione</button>
+      </div>
+
+      {err && (
+        <div style={{marginBottom:12,padding:"10px 14px",background:"var(--color-background-danger)",border:"0.5px solid var(--color-border-danger)",borderRadius:"var(--border-radius-md)",fontSize:13,color:"var(--color-text-danger)"}}>
+          {err} <button style={{...b,marginLeft:8,padding:"2px 10px"}} onClick={()=>{setLoading(true);loadAll();loadPresenze();}}>Riprova</button>
+        </div>
+      )}
+
+      {loading ? (
+        <div style={{padding:"40px 0",textAlign:"center",color:"var(--color-text-tertiary)",fontSize:14}}>Caricamento…</div>
+      ) : (
+      <div style={{display:"flex",gap:12}}>
+        <div style={{width:148,flexShrink:0}}>
+          <div style={{fontSize:11,color:"var(--color-text-tertiary)",textTransform:"uppercase",letterSpacing:"0.05em",marginBottom:6}}>Classi</div>
+          {classes.length===0 && <div style={{fontSize:12,color:"var(--color-text-tertiary)"}}>Nessuna classe. Creane una in Gestione.</div>}
+          {classes.map(c=>(
+            <button key={c.id} onClick={()=>setSelCls(c.id)} style={{display:"block",width:"100%",textAlign:"left",padding:"7px 10px",borderRadius:"var(--border-radius-md)",cursor:"pointer",fontSize:13,fontWeight:selCls===c.id?500:400,background:selCls===c.id?"var(--color-background-secondary)":"transparent",border:selCls===c.id?"0.5px solid var(--color-border-secondary)":"0.5px solid transparent",color:"var(--color-text-primary)",marginBottom:3}}>{c.nome}</button>
+          ))}
+        </div>
+
+        <div style={{flex:1,minWidth:0,overflowX:"auto"}}>
+
+          {view==="reg" && cls && (
+            <div style={{background:"var(--color-background-primary)",border:"0.5px solid var(--color-border-tertiary)",borderRadius:"var(--border-radius-lg)",overflow:"hidden"}}>
+              <table style={{width:"100%",borderCollapse:"collapse",tableLayout:"fixed"}}>
+                <colgroup>
+                  <col style={{width:140}} />
+                  <col style={{width:68}} />
+                  {HOURS.map(h=><col key={h} style={{width:48}} />)}
+                </colgroup>
+                <thead>
+                  <tr style={{background:"var(--color-background-secondary)",borderBottom:"0.5px solid var(--color-border-tertiary)"}}>
+                    <th style={{...th,textAlign:"left",padding:"8px 12px"}}>Studente</th>
+                    <th style={th}>Tutta la giornata</th>
+                    {HOURS.map(h=>(
+                      <th key={h} style={th}>
+                        <div>{h}</div>
+                        <div style={{fontSize:10,color:"var(--color-text-tertiary)",fontWeight:400}}>→{HOUR_END[h]}</div>
+                      </th>
+                    ))}
+                  </tr>
+                </thead>
+                <tbody>
+                  {clsStudents.length===0 && (
+                    <tr><td colSpan={8} style={{padding:"20px 14px",fontSize:13,color:"var(--color-text-tertiary)"}}>Nessuno studente. Aggiungili dalla sezione Gestione.</td></tr>
+                  )}
+                  {clsStudents.map((s,i)=>(
+                    <tr key={s.id} style={{borderTop:i>0?"0.5px solid var(--color-border-tertiary)":"none"}}>
+                      <td style={{padding:"6px 12px",fontSize:13}}>{s.nome}</td>
+                      <td style={{textAlign:"center",padding:"4px 2px"}}>
+                        <div style={{display:"flex",justifyContent:"center",gap:3}}>
+                          {CYCLE.filter(Boolean).map(st=>(
+                            <button key={st} onClick={()=>setAll(s.id,st)} title={`Segna tutto come ${st}`}
+                              style={{width:24,height:24,borderRadius:4,cursor:"pointer",border:`1px solid ${ST[st].fg}55`,background:ST[st].bg,color:ST[st].fg,fontSize:11,fontWeight:500}}>
+                              {ST[st].l}
+                            </button>
+                          ))}
+                        </div>
+                      </td>
+                      {HOURS.map(h=>{
+                        const state = stateOf(s.id,h);
+                        const info = state ? ST[state] : null;
+                        return (
+                          <td key={h} style={{textAlign:"center",padding:"4px 2px"}}>
+                            <button onClick={()=>cycleHour(s.id,h)}
+                              title={info?`${state} — clicca per cambiare`:"Clicca per segnare"}
+                              style={{width:40,height:30,borderRadius:"var(--border-radius-md)",cursor:"pointer",border:info?`1px solid ${info.fg}44`:"0.5px solid var(--color-border-tertiary)",background:info?info.bg:"transparent",color:info?info.fg:"var(--color-text-tertiary)",fontSize:13,fontWeight:info?500:400}}>
+                              {info?info.l:"·"}
+                            </button>
+                          </td>
+                        );
+                      })}
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          )}
+
+          {view==="reg" && !cls && classes.length>0 && (
+            <div style={{padding:"20px 0",color:"var(--color-text-tertiary)",fontSize:14}}>Seleziona una classe dall'elenco a sinistra.</div>
+          )}
+
+          {view==="stats" && cls && (
+            <StatsView cls={cls} clsStudents={clsStudents} date={date} />
+          )}
+
+          {view==="manage" && (
+            <div>
+              <div style={{marginBottom:20}}>
+                <div style={{fontSize:13,fontWeight:500,marginBottom:8}}>Aggiungi classe</div>
+                <div style={{display:"flex",gap:8}}>
+                  <input style={{...inp,width:210}} placeholder="Es. 3A — Classico" value={newCls} onChange={e=>setNewCls(e.target.value)} onKeyDown={e=>e.key==="Enter"&&addCls()} />
+                  <button style={b} onClick={addCls}>Aggiungi</button>
+                </div>
+              </div>
+              <div style={{marginBottom:20}}>
+                <div style={{fontSize:13,fontWeight:500,marginBottom:8}}>Classi esistenti</div>
+                <div style={{background:"var(--color-background-primary)",border:"0.5px solid var(--color-border-tertiary)",borderRadius:"var(--border-radius-lg)",overflow:"hidden"}}>
+                  {classes.length===0&&<div style={{padding:"12px 14px",fontSize:13,color:"var(--color-text-tertiary)"}}>Nessuna classe.</div>}
+                  {classes.map((c,i)=>(
+                    <div key={c.id} style={{display:"flex",alignItems:"center",padding:"9px 14px",borderTop:i>0?"0.5px solid var(--color-border-tertiary)":"none",gap:8}}>
+                      <span style={{flex:1,fontSize:14}}>{c.nome}</span>
+                      <span style={{fontSize:12,color:"var(--color-text-tertiary)"}}>{students.filter(s=>s.classe_id===c.id).length} studenti</span>
+                      <button style={{...b,color:"#A32D2D",borderColor:"#F09595"}} onClick={()=>remCls(c.id)}>Rimuovi</button>
+                    </div>
+                  ))}
+                </div>
+              </div>
+              {cls&&(
+                <div>
+                  <div style={{fontSize:13,fontWeight:500,marginBottom:8}}>Studenti in <em>{cls.nome}</em></div>
+                  <div style={{display:"flex",gap:8,marginBottom:10}}>
+                    <input style={{...inp,width:210}} placeholder="Cognome Nome" value={newStu} onChange={e=>setNewStu(e.target.value)} onKeyDown={e=>e.key==="Enter"&&addStu()} />
+                    <button style={b} onClick={addStu}>Aggiungi</button>
+                  </div>
+                  <div style={{background:"var(--color-background-primary)",border:"0.5px solid var(--color-border-tertiary)",borderRadius:"var(--border-radius-lg)",overflow:"hidden"}}>
+                    {clsStudents.length===0&&<div style={{padding:"12px 14px",fontSize:13,color:"var(--color-text-tertiary)"}}>Nessuno studente.</div>}
+                    {clsStudents.map((s,i)=>(
+                      <div key={s.id} style={{display:"flex",alignItems:"center",padding:"9px 14px",borderTop:i>0?"0.5px solid var(--color-border-tertiary)":"none"}}>
+                        <span style={{flex:1,fontSize:14}}>{s.nome}</span>
+                        <button style={{...b,color:"#A32D2D",borderColor:"#F09595"}} onClick={()=>remStu(s.id)}>Rimuovi</button>
+                      </div>
+                    ))}
+                  </div>
+                </div>
+              )}
+            </div>
+          )}
+
+        </div>
+      </div>
+      )}
+    </div>
+  );
+}
+
+function StatsView({ cls, clsStudents, date }) {
+  const [stats, setStats] = useState(null);
+  const [period, setPeriod] = useState("month");
+  const [err, setErr] = useState(null);
+
+  useEffect(() => {
+    async function load() {
+      try {
+        setErr(null); setStats(null);
+        let filter = "";
+        if (period === "day") filter = `&data=eq.${date}`;
+        else if (period === "month") { const m = date.slice(0,7); filter = `&data=gte.${m}-01&data=lte.${m}-31`; }
+        const ids = clsStudents.map(s=>s.id);
+        if (!ids.length) { setStats([]); return; }
+        const p = await sb(`presenze?select=*&studente_id=in.(${ids.join(",")})${filter}`);
+        const map = {};
+        clsStudents.forEach(s => { map[s.id] = { ...s, presente:0, assente:0, ritardo:0 }; });
+        (p||[]).forEach(r => { if (map[r.studente_id]) map[r.studente_id][r.stato]++; });
+        setStats(Object.values(map));
+      } catch (e) { setErr("Errore: " + e.message); }
+    }
+    load();
+  }, [period, date, cls.id]);
+
+  const b = {fontSize:13,padding:"5px 12px",border:"0.5px solid var(--color-border-secondary)",borderRadius:"var(--border-radius-md)",background:"transparent",cursor:"pointer",color:"var(--color-text-primary)"};
+  const bA = {...b,background:"var(--color-background-secondary)",fontWeight:500,border:"0.5px solid var(--color-border-primary)"};
+  const th = {fontSize:11,color:"var(--color-text-secondary)",fontWeight:400,textTransform:"uppercase",letterSpacing:"0.04em",padding:"8px 12px"};
+
+  const labels = { day:"Giorno selezionato", month:"Mese corrente", all:"Tutto lo storico" };
+
+  return (
+    <React.Fragment>
+      <div style={{display:"flex",gap:6,marginBottom:12,alignItems:"center",flexWrap:"wrap"}}>
+        <span style={{fontSize:13,color:"var(--color-text-secondary)",marginRight:4}}>Periodo:</span>
+        {Object.entries(labels).map(([k,v])=>(
+          <button key={k} style={period===k?bA:b} onClick={()=>setPeriod(k)}>{v}</button>
+        ))}
+      </div>
+      {err && <div style={{fontSize:13,color:"var(--color-text-danger)",marginBottom:10}}>{err}</div>}
+      <div style={{fontSize:13,color:"var(--color-text-secondary)",marginBottom:10}}>Ore totali per <strong>{cls.nome}</strong> — {labels[period].toLowerCase()}.</div>
+      <div style={{background:"var(--color-background-primary)",border:"0.5px solid var(--color-border-tertiary)",borderRadius:"var(--border-radius-lg)",overflow:"hidden"}}>
+        <table style={{width:"100%",borderCollapse:"collapse"}}>
+          <thead>
+            <tr style={{background:"var(--color-background-secondary)",borderBottom:"0.5px solid var(--color-border-tertiary)"}}>
+              <th style={{...th,textAlign:"left"}}>Studente</th>
+              <th style={{...th,textAlign:"center"}}>Ore presenti</th>
+              <th style={{...th,textAlign:"center"}}>Ore assenti</th>
+              <th style={{...th,textAlign:"center"}}>Ore ritardo</th>
+            </tr>
+          </thead>
+          <tbody>
+            {!stats && <tr><td colSpan={4} style={{padding:"16px 12px",fontSize:13,color:"var(--color-text-tertiary)"}}>Caricamento…</td></tr>}
+            {stats && stats.length===0 && <tr><td colSpan={4} style={{padding:"16px 12px",fontSize:13,color:"var(--color-text-tertiary)"}}>Nessuno studente.</td></tr>}
+            {stats && stats.map((s,i)=>(
+              <tr key={s.id} style={{borderTop:i>0?"0.5px solid var(--color-border-tertiary)":"none"}}>
+                <td style={{padding:"8px 12px",fontSize:14}}>{s.nome}</td>
+                <td style={{textAlign:"center",fontSize:14,color:"#3B6D11",fontWeight:500}}>{s.presente}</td>
+                <td style={{textAlign:"center",fontSize:14,color:"#A32D2D",fontWeight:500}}>{s.assente}</td>
+                <td style={{textAlign:"center",fontSize:14,color:"#854F0B",fontWeight:500}}>{s.ritardo}</td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
+    </React.Fragment>
+  );
+}
+
+ReactDOM.createRoot(document.getElementById("root")).render(<Registro />);
+</script>
+</body>
+</html>
