@@ -30,6 +30,7 @@
 <script src="https://cdnjs.cloudflare.com/ajax/libs/react/18.3.1/umd/react.production.min.js"></script>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/react-dom/18.3.1/umd/react-dom.production.min.js"></script>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/babel-standalone/7.26.2/babel.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js"></script>
 </head>
 <body>
 <div id="root"></div>
@@ -47,6 +48,7 @@ const RUOLI = {
 
 const HOURS = ['08:30','09:30','10:30','11:30','12:30','13:30'];
 const HOUR_END = {'08:30':'09:30','09:30':'10:30','10:30':'11:30','11:30':'12:30','12:30':'13:30','13:30':'14:30'};
+const MESI = ["gennaio","febbraio","marzo","aprile","maggio","giugno","luglio","agosto","settembre","ottobre","novembre","dicembre"];
 const CYCLE = [null,'presente','assente','ritardo'];
 const ST = {
   presente: { bg:'#EAF3DE', fg:'#3B6D11', l:'P' },
@@ -417,6 +419,7 @@ function Registro({ auth, onLogout }) {
     <>
       {view==="reg" && registerView()}
       {view==="stats" && cls && <StatsView cls={cls} clsStudents={clsStudents} date={date} tok={tok} />}
+      {view==="export" && isSegreteria && <ExportView classes={classes} students={students} tok={tok} />}
       {view==="manage" && isSegreteria && (
         <div>
           <div style={{marginBottom:20}}>
@@ -479,6 +482,7 @@ function Registro({ auth, onLogout }) {
         <input type="date" value={date} onChange={e=>setDate(e.target.value)} style={{...inp,width:"auto",fontSize:isMobile?15:13,padding:isMobile?"7px 10px":"5px 10px"}} />
         <button style={view==="reg"?bA:b} onClick={()=>setView("reg")}>Registro</button>
         <button style={view==="stats"?bA:b} onClick={()=>setView("stats")}>Storico</button>
+        {isSegreteria && <button style={view==="export"?bA:b} onClick={()=>setView("export")}>Esporta</button>}
         {isSegreteria && <button style={view==="manage"?bA:b} onClick={()=>setView("manage")}>Gestione</button>}
       </div>
 
@@ -511,6 +515,186 @@ function Registro({ auth, onLogout }) {
           <div style={{flex:1,minWidth:0,overflowX:"auto"}}>{content}</div>
         </div>
       )}
+    </div>
+  );
+}
+
+function ExportView({ classes, students, tok }) {
+  const [clsId, setClsId] = useState(classes[0]?.id || "");
+  const [stuId, setStuId] = useState("");
+  const [month, setMonth] = useState(new Date().toISOString().slice(0,7));
+  const [busy, setBusy] = useState(false);
+  const [err, setErr] = useState(null);
+
+  const clsStudents = students.filter(s => s.classe_id === clsId);
+
+  useEffect(() => {
+    if (clsStudents.length && !clsStudents.find(s=>s.id===stuId)) setStuId(clsStudents[0].id);
+    if (!clsStudents.length) setStuId("");
+  }, [clsId, students]);
+
+  const studentObj = students.find(s=>s.id===stuId);
+  const clsObj = classes.find(c=>c.id===clsId);
+  const safeName = (studentObj?.nome || "studente").replace(/[^a-zA-Z0-9]+/g,"_");
+
+  const fetchRows = async () => {
+    const start = month + "-01", end = month + "-31";
+    const p = await sb(`presenze?select=*&studente_id=eq.${stuId}&data=gte.${start}&data=lte.${end}&order=data,fascia`, {}, tok);
+    return p || [];
+  };
+
+  const doRiepilogo = async () => {
+    if (!stuId) return;
+    setErr(null); setBusy(true);
+    try {
+      const rows = await fetchRows();
+      let pr=0,as=0,ri=0,gi=0;
+      rows.forEach(r => {
+        if(r.stato==='presente')pr++; else if(r.stato==='assente')as++; else if(r.stato==='ritardo')ri++;
+        if(r.giustificato && (r.stato==='assente'||r.stato==='ritardo'))gi++;
+      });
+      const data = [{
+        Studente: studentObj?.nome || "",
+        Classe: clsObj?.nome || "",
+        Mese: month,
+        "Ore presenti": pr,
+        "Ore assenti": as,
+        "Ore ritardo": ri,
+        "di cui giustificate": gi,
+      }];
+      const ws = XLSX.utils.json_to_sheet(data);
+      const wb = XLSX.utils.book_new();
+      XLSX.utils.book_append_sheet(wb, ws, "Riepilogo");
+      XLSX.writeFile(wb, `riepilogo_${safeName}_${month}.xlsx`);
+    } catch(e){ setErr("Errore: "+e.message); } finally { setBusy(false); }
+  };
+
+  const doDettaglio = async () => {
+    if (!stuId) return;
+    setErr(null); setBusy(true);
+    try {
+      const rows = await fetchRows();
+      const data = rows.map(r => ({
+        Data: r.data,
+        Fascia: `${r.fascia}–${HOUR_END[r.fascia]||""}`,
+        Stato: r.stato,
+        Giustificato: r.giustificato ? "Sì" : "No",
+      }));
+      if (!data.length) data.push({ Data:"", Fascia:"", Stato:"Nessun dato nel mese", Giustificato:"" });
+      const ws = XLSX.utils.json_to_sheet(data);
+      const wb = XLSX.utils.book_new();
+      XLSX.utils.book_append_sheet(wb, ws, "Dettaglio");
+      XLSX.writeFile(wb, `dettaglio_${safeName}_${month}.xlsx`);
+    } catch(e){ setErr("Errore: "+e.message); } finally { setBusy(false); }
+  };
+
+  const MESE_LBL = (() => { const [y,m] = month.split("-"); return `${MESI[parseInt(m,10)-1]||""} ${y}`; })();
+
+  const openBlank = () => {
+    const w = window.open("", "_blank");
+    if (!w) { setErr("Consenti i popup del browser per generare il PDF."); return null; }
+    w.document.write("<p style='font-family:sans-serif;padding:24px;color:#555'>Generazione report…</p>");
+    return w;
+  };
+
+  const reportHtml = (titolo, inner) => `<!DOCTYPE html><html lang="it"><head><meta charset="utf-8"><title>${titolo} — ${studentObj?.nome||""}</title>
+<style>
+@page{size:A4;margin:18mm;}
+*{box-sizing:border-box;}
+body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Arial,sans-serif;color:#1a1a18;margin:0;}
+.head{display:flex;align-items:center;gap:14px;border-bottom:2px solid #1F3864;padding-bottom:12px;margin-bottom:18px;}
+.head img{height:54px;width:auto;}
+.h1{font-size:18px;font-weight:600;color:#1F3864;}
+.h2{font-size:13px;color:#2E75B5;}
+.meta{font-size:13px;margin-bottom:16px;line-height:1.8;}
+.meta b{color:#1F3864;}
+table{border-collapse:collapse;width:100%;font-size:13px;}
+th{background:#1F3864;color:#fff;text-align:left;padding:7px 10px;font-weight:500;}
+td{padding:6px 10px;border-bottom:1px solid #dddddd;}
+tr:nth-child(even) td{background:#f3f6fb;}
+.foot{margin-top:24px;font-size:11px;color:#888888;border-top:1px solid #dddddd;padding-top:8px;}
+</style></head><body>
+<div class="head"><img src="${location.origin}/logo.png" onerror="this.style.display='none'"/><div><div class="h1">Registro presenze</div><div class="h2">${titolo}</div></div></div>
+<div class="meta"><div><b>Studente:</b> ${studentObj?.nome||""}</div><div><b>Classe:</b> ${clsObj?.nome||""}</div><div><b>Mese:</b> ${MESE_LBL}</div></div>
+${inner}
+<div class="foot">Report generato il ${new Date().toLocaleDateString("it-IT")}</div>
+<script>window.onload=function(){setTimeout(function(){window.print();},300);};<\/script>
+</body></html>`;
+
+  const pdfRiepilogo = async () => {
+    if (!stuId) return;
+    const w = openBlank(); if (!w) return;
+    setErr(null); setBusy(true);
+    try {
+      const rows = await fetchRows();
+      let pr=0,as=0,ri=0,gi=0;
+      rows.forEach(r => { if(r.stato==='presente')pr++; else if(r.stato==='assente')as++; else if(r.stato==='ritardo')ri++; if(r.giustificato&&(r.stato==='assente'||r.stato==='ritardo'))gi++; });
+      const inner = `<table><tr><th>Ore presenti</th><th>Ore assenti</th><th>Ore ritardo</th><th>di cui giustificate</th></tr><tr><td>${pr}</td><td>${as}</td><td>${ri}</td><td>${gi}</td></tr></table>`;
+      w.document.open(); w.document.write(reportHtml("Riepilogo mensile", inner)); w.document.close();
+    } catch(e){ setErr("Errore: "+e.message); try{w.close();}catch(_){} } finally { setBusy(false); }
+  };
+
+  const pdfDettaglio = async () => {
+    if (!stuId) return;
+    const w = openBlank(); if (!w) return;
+    setErr(null); setBusy(true);
+    try {
+      const rows = await fetchRows();
+      const body = rows.length
+        ? rows.map(r => `<tr><td>${r.data.split("-").reverse().join("/")}</td><td>${r.fascia}–${HOUR_END[r.fascia]||""}</td><td>${r.stato}</td><td>${r.giustificato?"Sì":"No"}</td></tr>`).join("")
+        : `<tr><td colspan="4" style="text-align:center;color:#888">Nessun dato registrato nel mese</td></tr>`;
+      const inner = `<table><tr><th>Data</th><th>Fascia</th><th>Stato</th><th>Giustificato</th></tr>${body}</table>`;
+      w.document.open(); w.document.write(reportHtml("Dettaglio mensile", inner)); w.document.close();
+    } catch(e){ setErr("Errore: "+e.message); try{w.close();}catch(_){} } finally { setBusy(false); }
+  };
+
+  const lbl = {fontSize:12,color:"var(--color-text-tertiary)",textTransform:"uppercase",letterSpacing:"0.05em",marginBottom:6};
+  const sel = {width:"100%",maxWidth:320,fontSize:14,padding:"8px 10px",borderRadius:"var(--border-radius-md)",border:"0.5px solid var(--color-border-secondary)",background:"var(--color-background-primary)",color:"var(--color-text-primary)"};
+  const dlBtn = {fontSize:14,padding:"9px 16px",borderRadius:"var(--border-radius-md)",cursor:stuId&&!busy?"pointer":"default",border:"none",background:stuId&&!busy?"#1F3864":"var(--color-background-secondary)",color:stuId&&!busy?"#fff":"var(--color-text-tertiary)",fontWeight:500};
+  const dlBtn2 = {fontSize:14,padding:"9px 16px",borderRadius:"var(--border-radius-md)",cursor:stuId&&!busy?"pointer":"default",border:"0.5px solid var(--color-border-secondary)",background:"transparent",color:stuId&&!busy?"var(--color-text-primary)":"var(--color-text-tertiary)",fontWeight:500};
+
+  return (
+    <div style={{maxWidth:340}}>
+      <div style={{fontSize:13,color:"var(--color-text-secondary)",marginBottom:16}}>Genera un archivio Excel mensile per un singolo studente.</div>
+
+      <div style={{marginBottom:14}}>
+        <div style={lbl}>Classe</div>
+        <select value={clsId} onChange={e=>setClsId(e.target.value)} style={sel}>
+          {classes.length===0 && <option value="">Nessuna classe</option>}
+          {classes.map(c=><option key={c.id} value={c.id}>{c.nome}</option>)}
+        </select>
+      </div>
+
+      <div style={{marginBottom:14}}>
+        <div style={lbl}>Studente</div>
+        <select value={stuId} onChange={e=>setStuId(e.target.value)} style={sel}>
+          {clsStudents.length===0 && <option value="">Nessuno studente</option>}
+          {clsStudents.map(s=><option key={s.id} value={s.id}>{s.nome}</option>)}
+        </select>
+      </div>
+
+      <div style={{marginBottom:20}}>
+        <div style={lbl}>Mese</div>
+        <input type="month" value={month} onChange={e=>setMonth(e.target.value)} style={sel} />
+      </div>
+
+      {err && <div style={{fontSize:13,color:"var(--color-text-danger)",marginBottom:12}}>{err}</div>}
+
+      <div style={{...lbl,marginTop:4}}>File Excel</div>
+      <div style={{display:"flex",gap:10,flexWrap:"wrap",marginBottom:18}}>
+        <button style={dlBtn} disabled={!stuId||busy} onClick={doRiepilogo}>{busy?"Attendere…":"Riepilogo .xlsx"}</button>
+        <button style={dlBtn2} disabled={!stuId||busy} onClick={doDettaglio}>Dettaglio .xlsx</button>
+      </div>
+
+      <div style={lbl}>Report PDF</div>
+      <div style={{display:"flex",gap:10,flexWrap:"wrap"}}>
+        <button style={dlBtn} disabled={!stuId||busy} onClick={pdfRiepilogo}>Riepilogo PDF</button>
+        <button style={dlBtn2} disabled={!stuId||busy} onClick={pdfDettaglio}>Dettaglio PDF</button>
+      </div>
+
+      <div style={{fontSize:11,color:"var(--color-text-tertiary)",marginTop:14}}>
+        Il <strong>riepilogo</strong> contiene i totali del mese (presenze, assenze, ritardi, di cui giustificate). Il <strong>dettaglio</strong> elenca ogni singola fascia oraria registrata.
+      </div>
     </div>
   );
 }
