@@ -40,6 +40,11 @@ const { useState, useEffect, useCallback } = React;
 const SUPABASE_URL = "https://esowfbptahnzxbathqzf.supabase.co";
 const SUPABASE_KEY = "sb_publishable_lil3SYpFe57jbIDNgGryNw_a-tU29Cl";
 
+const RUOLI = {
+  docente:    { email: "docente@registro.app",    label: "Docente" },
+  segreteria: { email: "segreteria@registro.app", label: "Segreteria" },
+};
+
 const HOURS = ['08:30','09:30','10:30','11:30','12:30','13:30'];
 const HOUR_END = {'08:30':'09:30','09:30':'10:30','10:30':'11:30','11:30':'12:30','12:30':'13:30','13:30':'14:30'};
 const CYCLE = [null,'presente','assente','ritardo'];
@@ -49,12 +54,12 @@ const ST = {
   ritardo:  { bg:'#FAEEDA', fg:'#854F0B', l:'R' },
 };
 
-async function sb(path, opts = {}) {
+async function sb(path, opts = {}, token) {
   const res = await fetch(`${SUPABASE_URL}/rest/v1/${path}`, {
     ...opts,
     headers: {
       apikey: SUPABASE_KEY,
-      Authorization: `Bearer ${SUPABASE_KEY}`,
+      Authorization: `Bearer ${token || SUPABASE_KEY}`,
       "Content-Type": "application/json",
       ...(opts.headers || {}),
     },
@@ -64,7 +69,72 @@ async function sb(path, opts = {}) {
   return txt ? JSON.parse(txt) : null;
 }
 
-function Registro() {
+async function signIn(email, password) {
+  const res = await fetch(`${SUPABASE_URL}/auth/v1/token?grant_type=password`, {
+    method: "POST",
+    headers: { apikey: SUPABASE_KEY, "Content-Type": "application/json" },
+    body: JSON.stringify({ email, password }),
+  });
+  if (!res.ok) throw new Error("Password non corretta");
+  return res.json();
+}
+
+function Login({ onLogin }) {
+  const [ruolo, setRuolo] = useState("docente");
+  const [pw, setPw] = useState("");
+  const [err, setErr] = useState(null);
+  const [busy, setBusy] = useState(false);
+
+  const entra = async () => {
+    setErr(null); setBusy(true);
+    try {
+      const r = RUOLI[ruolo];
+      const data = await signIn(r.email, pw);
+      onLogin({ ruolo, token: data.access_token, refresh: data.refresh_token });
+    } catch (e) {
+      setErr("Password non corretta. Riprova.");
+    } finally { setBusy(false); }
+  };
+
+  const card = {fontSize:14,padding:"7px 14px",borderRadius:"var(--border-radius-md)",cursor:"pointer",border:"0.5px solid var(--color-border-secondary)",background:"transparent",color:"var(--color-text-primary)"};
+  const cardA = {...card,background:"var(--color-background-secondary)",fontWeight:500,border:"0.5px solid var(--color-border-primary)"};
+
+  return (
+    <div style={{maxWidth:360,margin:"60px auto",padding:"0 16px",fontFamily:"var(--font-sans)",color:"var(--color-text-primary)"}}>
+      <div style={{fontSize:20,fontWeight:500,marginBottom:6,textAlign:"center"}}>Registro presenze</div>
+      <div style={{fontSize:13,color:"var(--color-text-secondary)",marginBottom:24,textAlign:"center"}}>Accedi per continuare</div>
+
+      <div style={{fontSize:12,color:"var(--color-text-tertiary)",textTransform:"uppercase",letterSpacing:"0.05em",marginBottom:8}}>Ruolo</div>
+      <div style={{display:"flex",gap:8,marginBottom:18}}>
+        <button style={ruolo==="docente"?cardA:card} onClick={()=>setRuolo("docente")}>Docente</button>
+        <button style={ruolo==="segreteria"?cardA:card} onClick={()=>setRuolo("segreteria")}>Segreteria</button>
+      </div>
+
+      <div style={{fontSize:12,color:"var(--color-text-tertiary)",textTransform:"uppercase",letterSpacing:"0.05em",marginBottom:8}}>Password</div>
+      <input type="password" value={pw} autoFocus
+        onChange={e=>setPw(e.target.value)}
+        onKeyDown={e=>e.key==="Enter"&&pw&&!busy&&entra()}
+        style={{width:"100%",fontSize:15,padding:"9px 12px",border:"0.5px solid var(--color-border-secondary)",borderRadius:"var(--border-radius-md)",background:"transparent",color:"var(--color-text-primary)",outline:"none",marginBottom:14,boxSizing:"border-box"}} />
+
+      {err && <div style={{fontSize:13,color:"var(--color-text-danger)",marginBottom:12}}>{err}</div>}
+
+      <button onClick={entra} disabled={!pw||busy}
+        style={{width:"100%",fontSize:15,padding:"10px",borderRadius:"var(--border-radius-md)",cursor:pw&&!busy?"pointer":"default",border:"none",background:pw&&!busy?"#1F3864":"var(--color-background-secondary)",color:pw&&!busy?"#fff":"var(--color-text-tertiary)",fontWeight:500}}>
+        {busy?"Accesso…":"Entra"}
+      </button>
+    </div>
+  );
+}
+
+function App() {
+  const [auth, setAuth] = useState(null);
+  if (!auth) return <Login onLogin={setAuth} />;
+  return <Registro auth={auth} onLogout={()=>setAuth(null)} />;
+}
+
+function Registro({ auth, onLogout }) {
+  const isSegreteria = auth.ruolo === "segreteria";
+  const tok = auth.token;
   const [classes, setClasses] = useState([]);
   const [students, setStudents] = useState([]);
   const [presenze, setPresenze] = useState([]);
@@ -80,8 +150,8 @@ function Registro() {
     try {
       setErr(null);
       const [cls, stu] = await Promise.all([
-        sb("classi?select=*&order=nome"),
-        sb("studenti?select=*&order=nome"),
+        sb("classi?select=*&order=nome", {}, tok),
+        sb("studenti?select=*&order=nome", {}, tok),
       ]);
       setClasses(cls || []);
       setStudents(stu || []);
@@ -91,16 +161,16 @@ function Registro() {
     } finally {
       setLoading(false);
     }
-  }, []);
+  }, [tok]);
 
   const loadPresenze = useCallback(async () => {
     try {
-      const p = await sb(`presenze?select=*&data=eq.${date}`);
+      const p = await sb(`presenze?select=*&data=eq.${date}`, {}, tok);
       setPresenze(p || []);
     } catch (e) {
       setErr("Errore nel caricare le presenze: " + e.message);
     }
-  }, [date]);
+  }, [date, tok]);
 
   useEffect(() => { loadAll(); }, [loadAll]);
   useEffect(() => { loadPresenze(); }, [loadPresenze]);
@@ -121,13 +191,13 @@ function Registro() {
     });
     try {
       if (next === null) {
-        if (existing?.id) await sb(`presenze?id=eq.${existing.id}`, { method: "DELETE" });
+        if (existing?.id) await sb(`presenze?id=eq.${existing.id}`, { method: "DELETE" }, tok);
       } else {
         await sb("presenze?on_conflict=studente_id,data,fascia", {
           method: "POST",
           headers: { Prefer: "resolution=merge-duplicates" },
           body: JSON.stringify({ studente_id: sid, data: date, fascia: h, stato: next }),
-        });
+        }, tok);
         loadPresenze();
       }
     } catch (e) { setErr("Errore nel salvataggio: " + e.message); loadPresenze(); }
@@ -140,7 +210,7 @@ function Registro() {
         method: "POST",
         headers: { Prefer: "resolution=merge-duplicates" },
         body: JSON.stringify(rows),
-      });
+      }, tok);
       loadPresenze();
     } catch (e) { setErr("Errore: " + e.message); }
   };
@@ -148,7 +218,7 @@ function Registro() {
   const addCls = async () => {
     const nome = newCls.trim(); if (!nome) return;
     try {
-      const [c] = await sb("classi", { method: "POST", headers: { Prefer: "return=representation" }, body: JSON.stringify({ nome }) });
+      const [c] = await sb("classi", { method: "POST", headers: { Prefer: "return=representation" }, body: JSON.stringify({ nome }) }, tok);
       setNewCls(""); await loadAll(); if (c) setSelCls(c.id);
     } catch (e) { setErr("Errore: " + e.message); }
   };
@@ -156,18 +226,18 @@ function Registro() {
   const addStu = async () => {
     const nome = newStu.trim(); if (!nome || !cls) return;
     try {
-      await sb("studenti", { method: "POST", body: JSON.stringify({ nome, classe_id: cls.id }) });
+      await sb("studenti", { method: "POST", body: JSON.stringify({ nome, classe_id: cls.id }) }, tok);
       setNewStu(""); loadAll();
     } catch (e) { setErr("Errore: " + e.message); }
   };
 
   const remCls = async (id) => {
-    try { await sb(`classi?id=eq.${id}`, { method: "DELETE" }); if (selCls===id) setSelCls(null); loadAll(); }
+    try { await sb(`classi?id=eq.${id}`, { method: "DELETE" }, tok); if (selCls===id) setSelCls(null); loadAll(); }
     catch (e) { setErr("Errore: " + e.message); }
   };
 
   const remStu = async (id) => {
-    try { await sb(`studenti?id=eq.${id}`, { method: "DELETE" }); loadAll(); }
+    try { await sb(`studenti?id=eq.${id}`, { method: "DELETE" }, tok); loadAll(); }
     catch (e) { setErr("Errore: " + e.message); }
   };
 
@@ -187,7 +257,9 @@ function Registro() {
         <input type="date" value={date} onChange={e=>setDate(e.target.value)} style={{...inp,width:"auto"}} />
         <button style={view==="reg"?bA:b} onClick={()=>setView("reg")}>Registro</button>
         <button style={view==="stats"?bA:b} onClick={()=>setView("stats")}>Storico</button>
-        <button style={view==="manage"?bA:b} onClick={()=>setView("manage")}>Gestione</button>
+        {isSegreteria && <button style={view==="manage"?bA:b} onClick={()=>setView("manage")}>Gestione</button>}
+        <span style={{fontSize:11,color:"var(--color-text-tertiary)",marginLeft:4}}>{isSegreteria?"Segreteria":"Docente"}</span>
+        <button style={{...b,padding:"5px 10px"}} onClick={onLogout}>Esci</button>
       </div>
 
       {err && (
@@ -272,10 +344,10 @@ function Registro() {
           )}
 
           {view==="stats" && cls && (
-            <StatsView cls={cls} clsStudents={clsStudents} date={date} />
+            <StatsView cls={cls} clsStudents={clsStudents} date={date} tok={tok} />
           )}
 
-          {view==="manage" && (
+          {view==="manage" && isSegreteria && (
             <div>
               <div style={{marginBottom:20}}>
                 <div style={{fontSize:13,fontWeight:500,marginBottom:8}}>Aggiungi classe</div>
@@ -325,7 +397,7 @@ function Registro() {
   );
 }
 
-function StatsView({ cls, clsStudents, date }) {
+function StatsView({ cls, clsStudents, date, tok }) {
   const [stats, setStats] = useState(null);
   const [period, setPeriod] = useState("month");
   const [err, setErr] = useState(null);
@@ -339,7 +411,7 @@ function StatsView({ cls, clsStudents, date }) {
         else if (period === "month") { const m = date.slice(0,7); filter = `&data=gte.${m}-01&data=lte.${m}-31`; }
         const ids = clsStudents.map(s=>s.id);
         if (!ids.length) { setStats([]); return; }
-        const p = await sb(`presenze?select=*&studente_id=in.(${ids.join(",")})${filter}`);
+        const p = await sb(`presenze?select=*&studente_id=in.(${ids.join(",")})${filter}`, {}, tok);
         const map = {};
         clsStudents.forEach(s => { map[s.id] = { ...s, presente:0, assente:0, ritardo:0 }; });
         (p||[]).forEach(r => { if (map[r.studente_id]) map[r.studente_id][r.stato]++; });
@@ -393,7 +465,7 @@ function StatsView({ cls, clsStudents, date }) {
   );
 }
 
-ReactDOM.createRoot(document.getElementById("root")).render(<Registro />);
+ReactDOM.createRoot(document.getElementById("root")).render(<App />);
 </script>
 </body>
 </html>
