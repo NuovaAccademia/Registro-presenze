@@ -102,7 +102,7 @@ function Login({ onLogin }) {
   return (
     <div style={{maxWidth:360,margin:"60px auto",padding:"0 16px",fontFamily:"var(--font-sans)",color:"var(--color-text-primary)"}}>
       <div style={{textAlign:"center",marginBottom:18}}>
-        <img src="logo.png" alt="Logo" style={{maxWidth:"100%",maxHeight:240,height:"auto",width:"auto"}} />
+        <img src="logo.png" alt="Logo" style={{maxWidth:220,maxHeight:160,height:"auto",width:"auto"}} />
       </div>
       <div style={{fontSize:20,fontWeight:500,marginBottom:6,textAlign:"center"}}>Registro presenze</div>
       <div style={{fontSize:13,color:"var(--color-text-secondary)",marginBottom:24,textAlign:"center"}}>Accedi per continuare</div>
@@ -183,6 +183,7 @@ function Registro({ auth, onLogout }) {
 
   const presKey = (sid, h) => presenze.find(p => p.studente_id === sid && p.fascia === h);
   const stateOf = (sid, h) => presKey(sid, h)?.stato || null;
+  const giustOf = (sid, h) => presKey(sid, h)?.giustificato || false;
 
   const cycleHour = async (sid, h) => {
     const cur = stateOf(sid, h);
@@ -190,7 +191,7 @@ function Registro({ auth, onLogout }) {
     const existing = presKey(sid, h);
     setPresenze(prev => {
       const others = prev.filter(p => !(p.studente_id === sid && p.fascia === h));
-      return next ? [...others, { ...(existing||{}), studente_id: sid, fascia: h, data: date, stato: next }] : others;
+      return next ? [...others, { ...(existing||{}), studente_id: sid, fascia: h, data: date, stato: next, giustificato: false }] : others;
     });
     try {
       if (next === null) {
@@ -199,16 +200,32 @@ function Registro({ auth, onLogout }) {
         await sb("presenze?on_conflict=studente_id,data,fascia", {
           method: "POST",
           headers: { Prefer: "resolution=merge-duplicates" },
-          body: JSON.stringify({ studente_id: sid, data: date, fascia: h, stato: next }),
+          body: JSON.stringify({ studente_id: sid, data: date, fascia: h, stato: next, giustificato: false }),
         }, tok);
         loadPresenze();
       }
     } catch (e) { setErr("Errore nel salvataggio: " + e.message); loadPresenze(); }
   };
 
+  const toggleGiust = async (sid, h) => {
+    if (!isSegreteria) return;
+    const existing = presKey(sid, h);
+    if (!existing || !existing.stato) return;
+    const newVal = !existing.giustificato;
+    setPresenze(prev => prev.map(p => (p.studente_id===sid && p.fascia===h) ? { ...p, giustificato:newVal } : p));
+    try {
+      await sb("presenze?on_conflict=studente_id,data,fascia", {
+        method: "POST",
+        headers: { Prefer: "resolution=merge-duplicates" },
+        body: JSON.stringify({ studente_id: sid, data: date, fascia: h, stato: existing.stato, giustificato: newVal }),
+      }, tok);
+      loadPresenze();
+    } catch (e) { setErr("Errore: " + e.message); loadPresenze(); }
+  };
+
   const setAll = async (sid, status) => {
     try {
-      const rows = HOURS.map(h => ({ studente_id: sid, data: date, fascia: h, stato: status }));
+      const rows = HOURS.map(h => ({ studente_id: sid, data: date, fascia: h, stato: status, giustificato: false }));
       await sb("presenze?on_conflict=studente_id,data,fascia", {
         method: "POST",
         headers: { Prefer: "resolution=merge-duplicates" },
@@ -278,7 +295,7 @@ function Registro({ auth, onLogout }) {
       <div style={{display:"flex",gap:12}}>
         <div style={{width:148,flexShrink:0}}>
           <div style={{fontSize:11,color:"var(--color-text-tertiary)",textTransform:"uppercase",letterSpacing:"0.05em",marginBottom:6}}>Classi</div>
-          {classes.length===0 && <div style={{fontSize:12,color:"var(--color-text-tertiary)"}}>Nessuna classe. Creane una in Gestione.</div>}
+          {classes.length===0 && <div style={{fontSize:12,color:"var(--color-text-tertiary)"}}>Nessuna classe.{isSegreteria?" Creane una in Gestione.":""}</div>}
           {classes.map(c=>(
             <button key={c.id} onClick={()=>setSelCls(c.id)} style={{display:"block",width:"100%",textAlign:"left",padding:"7px 10px",borderRadius:"var(--border-radius-md)",cursor:"pointer",fontSize:13,fontWeight:selCls===c.id?500:400,background:selCls===c.id?"var(--color-background-secondary)":"transparent",border:selCls===c.id?"0.5px solid var(--color-border-secondary)":"0.5px solid transparent",color:"var(--color-text-primary)",marginBottom:3}}>{c.nome}</button>
           ))}
@@ -287,6 +304,7 @@ function Registro({ auth, onLogout }) {
         <div style={{flex:1,minWidth:0,overflowX:"auto"}}>
 
           {view==="reg" && cls && (
+            <div>
             <div style={{background:"var(--color-background-primary)",border:"0.5px solid var(--color-border-tertiary)",borderRadius:"var(--border-radius-lg)",overflow:"hidden"}}>
               <table style={{width:"100%",borderCollapse:"collapse",tableLayout:"fixed"}}>
                 <colgroup>
@@ -308,7 +326,7 @@ function Registro({ auth, onLogout }) {
                 </thead>
                 <tbody>
                   {clsStudents.length===0 && (
-                    <tr><td colSpan={8} style={{padding:"20px 14px",fontSize:13,color:"var(--color-text-tertiary)"}}>Nessuno studente. Aggiungili dalla sezione Gestione.</td></tr>
+                    <tr><td colSpan={8} style={{padding:"20px 14px",fontSize:13,color:"var(--color-text-tertiary)"}}>Nessuno studente.{isSegreteria?" Aggiungili dalla sezione Gestione.":""}</td></tr>
                   )}
                   {clsStudents.map((s,i)=>(
                     <tr key={s.id} style={{borderTop:i>0?"0.5px solid var(--color-border-tertiary)":"none"}}>
@@ -326,13 +344,27 @@ function Registro({ auth, onLogout }) {
                       {HOURS.map(h=>{
                         const state = stateOf(s.id,h);
                         const info = state ? ST[state] : null;
+                        const giust = giustOf(s.id,h);
+                        const canGiust = state==='assente' || state==='ritardo';
                         return (
                           <td key={h} style={{textAlign:"center",padding:"4px 2px"}}>
-                            <button onClick={()=>cycleHour(s.id,h)}
-                              title={info?`${state} — clicca per cambiare`:"Clicca per segnare"}
-                              style={{width:40,height:30,borderRadius:"var(--border-radius-md)",cursor:"pointer",border:info?`1px solid ${info.fg}44`:"0.5px solid var(--color-border-tertiary)",background:info?info.bg:"transparent",color:info?info.fg:"var(--color-text-tertiary)",fontSize:13,fontWeight:info?500:400}}>
-                              {info?info.l:"·"}
-                            </button>
+                            <div style={{position:"relative",display:"inline-block"}}>
+                              <button onClick={()=>cycleHour(s.id,h)}
+                                title={info?`${state} — clicca per cambiare`:"Clicca per segnare"}
+                                style={{width:40,height:30,borderRadius:"var(--border-radius-md)",cursor:"pointer",border:info?`1px solid ${info.fg}44`:"0.5px solid var(--color-border-tertiary)",background:info?info.bg:"transparent",color:info?info.fg:"var(--color-text-tertiary)",fontSize:13,fontWeight:info?500:400}}>
+                                {info?info.l:"·"}
+                              </button>
+                              {canGiust && (giust || isSegreteria) && (
+                                <span onClick={()=>toggleGiust(s.id,h)}
+                                  title={giust?"Giustificata":"Segna come giustificata"}
+                                  style={{position:"absolute",top:-5,right:-5,width:15,height:15,borderRadius:"50%",fontSize:9,fontWeight:600,lineHeight:"15px",textAlign:"center",cursor:isSegreteria?"pointer":"default",
+                                    background:giust?"#3B6D11":"var(--color-background-primary)",
+                                    color:giust?"#fff":"var(--color-text-tertiary)",
+                                    border:giust?"1px solid #3B6D11":"1px solid var(--color-border-secondary)"}}>
+                                  G
+                                </span>
+                              )}
+                            </div>
                           </td>
                         );
                       })}
@@ -340,6 +372,10 @@ function Registro({ auth, onLogout }) {
                   ))}
                 </tbody>
               </table>
+            </div>
+            <div style={{fontSize:11,color:"var(--color-text-tertiary)",marginTop:8,paddingLeft:2}}>
+              La pallina <strong>G</strong> sulle assenze e sui ritardi indica se sono giustificati{isSegreteria?" — toccala per giustificare.":" (solo la segreteria può modificarli)."}
+            </div>
             </div>
           )}
 
@@ -417,13 +453,17 @@ function StatsView({ cls, clsStudents, date, tok }) {
         if (!ids.length) { setStats([]); return; }
         const p = await sb(`presenze?select=*&studente_id=in.(${ids.join(",")})${filter}`, {}, tok);
         const map = {};
-        clsStudents.forEach(s => { map[s.id] = { ...s, presente:0, assente:0, ritardo:0 }; });
-        (p||[]).forEach(r => { if (map[r.studente_id]) map[r.studente_id][r.stato]++; });
+        clsStudents.forEach(s => { map[s.id] = { ...s, presente:0, assente:0, ritardo:0, giustificate:0 }; });
+        (p||[]).forEach(r => {
+          if (!map[r.studente_id]) return;
+          map[r.studente_id][r.stato]++;
+          if (r.giustificato && (r.stato==='assente' || r.stato==='ritardo')) map[r.studente_id].giustificate++;
+        });
         setStats(Object.values(map));
       } catch (e) { setErr("Errore: " + e.message); }
     }
     load();
-  }, [period, date, cls.id]);
+  }, [period, date, cls.id, tok]);
 
   const b = {fontSize:13,padding:"5px 12px",border:"0.5px solid var(--color-border-secondary)",borderRadius:"var(--border-radius-md)",background:"transparent",cursor:"pointer",color:"var(--color-text-primary)"};
   const bA = {...b,background:"var(--color-background-secondary)",fontWeight:500,border:"0.5px solid var(--color-border-primary)"};
@@ -449,17 +489,19 @@ function StatsView({ cls, clsStudents, date, tok }) {
               <th style={{...th,textAlign:"center"}}>Ore presenti</th>
               <th style={{...th,textAlign:"center"}}>Ore assenti</th>
               <th style={{...th,textAlign:"center"}}>Ore ritardo</th>
+              <th style={{...th,textAlign:"center"}}>di cui giustificate</th>
             </tr>
           </thead>
           <tbody>
-            {!stats && <tr><td colSpan={4} style={{padding:"16px 12px",fontSize:13,color:"var(--color-text-tertiary)"}}>Caricamento…</td></tr>}
-            {stats && stats.length===0 && <tr><td colSpan={4} style={{padding:"16px 12px",fontSize:13,color:"var(--color-text-tertiary)"}}>Nessuno studente.</td></tr>}
+            {!stats && <tr><td colSpan={5} style={{padding:"16px 12px",fontSize:13,color:"var(--color-text-tertiary)"}}>Caricamento…</td></tr>}
+            {stats && stats.length===0 && <tr><td colSpan={5} style={{padding:"16px 12px",fontSize:13,color:"var(--color-text-tertiary)"}}>Nessuno studente.</td></tr>}
             {stats && stats.map((s,i)=>(
               <tr key={s.id} style={{borderTop:i>0?"0.5px solid var(--color-border-tertiary)":"none"}}>
                 <td style={{padding:"8px 12px",fontSize:14}}>{s.nome}</td>
                 <td style={{textAlign:"center",fontSize:14,color:"#3B6D11",fontWeight:500}}>{s.presente}</td>
                 <td style={{textAlign:"center",fontSize:14,color:"#A32D2D",fontWeight:500}}>{s.assente}</td>
                 <td style={{textAlign:"center",fontSize:14,color:"#854F0B",fontWeight:500}}>{s.ritardo}</td>
+                <td style={{textAlign:"center",fontSize:14,color:"#3B6D11",fontWeight:500}}>{s.giustificate}</td>
               </tr>
             ))}
           </tbody>
