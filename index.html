@@ -283,6 +283,7 @@ function Registro({ auth, onLogout }) {
 
   const b = {fontSize:13,padding:"5px 12px",border:"0.5px solid var(--color-border-secondary)",borderRadius:"var(--border-radius-md)",background:"transparent",cursor:"pointer",color:"var(--color-text-primary)"};
   const bA = {...b,background:"var(--color-background-secondary)",fontWeight:500,border:"0.5px solid var(--color-border-primary)"};
+  const bBlue = {...b,background:"#1F3864",color:"#fff",fontWeight:500,border:"0.5px solid #1F3864"};
   const inp = {fontSize:13,padding:"5px 10px",border:"0.5px solid var(--color-border-secondary)",borderRadius:"var(--border-radius-md)",background:"transparent",color:"var(--color-text-primary)",outline:"none"};
   const th = {fontSize:11,color:"var(--color-text-secondary)",fontWeight:400,textTransform:"uppercase",letterSpacing:"0.04em",padding:"8px 4px",textAlign:"center"};
 
@@ -487,10 +488,10 @@ function Registro({ auth, onLogout }) {
 
       <div style={{display:"flex",alignItems:"center",gap:8,marginBottom:14,flexWrap:"wrap"}}>
         <input type="date" value={date} onChange={e=>setDate(e.target.value)} style={{...inp,width:"auto",fontSize:isMobile?15:13,padding:isMobile?"7px 10px":"5px 10px"}} />
-        <button style={view==="reg"?bA:b} onClick={()=>setView("reg")}>Registro</button>
-        <button style={view==="stats"?bA:b} onClick={()=>setView("stats")}>Storico</button>
-        {isSegreteria && <button style={view==="export"?bA:b} onClick={()=>setView("export")}>Esporta</button>}
-        {isSegreteria && <button style={view==="manage"?bA:b} onClick={()=>setView("manage")}>Gestione</button>}
+        <button style={view==="reg"?bBlue:b} onClick={()=>setView("reg")}>Registro</button>
+        <button style={view==="stats"?bBlue:b} onClick={()=>setView("stats")}>Storico</button>
+        {isSegreteria && <button style={view==="export"?bBlue:b} onClick={()=>setView("export")}>Esporta</button>}
+        {isSegreteria && <button style={view==="manage"?bBlue:b} onClick={()=>setView("manage")}>Gestione</button>}
       </div>
 
       {err && (
