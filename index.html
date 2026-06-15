@@ -81,6 +81,13 @@ async function signIn(email, password) {
   return res.json();
 }
 
+function monthRange(ym) {
+  const [y, m] = ym.split("-").map(Number);
+  const start = `${ym}-01`;
+  const nm = m === 12 ? `${y+1}-01` : `${y}-${String(m+1).padStart(2,"0")}`;
+  return { start, endExcl: `${nm}-01` };
+}
+
 function useIsMobile() {
   const [m, setM] = useState(typeof window !== "undefined" && window.innerWidth < 640);
   useEffect(() => {
@@ -710,7 +717,7 @@ function StatsView({ cls, clsStudents, date, tok }) {
         setErr(null); setStats(null);
         let filter = "";
         if (period === "day") filter = `&data=eq.${date}`;
-        else if (period === "month") { const m = date.slice(0,7); filter = `&data=gte.${m}-01&data=lte.${m}-31`; }
+        else if (period === "month") { const { start, endExcl } = monthRange(date.slice(0,7)); filter = `&data=gte.${start}&data=lt.${endExcl}`; }
         const ids = clsStudents.map(s=>s.id);
         if (!ids.length) { setStats([]); return; }
         const p = await sb(`presenze?select=*&studente_id=in.(${ids.join(",")})${filter}`, {}, tok);
