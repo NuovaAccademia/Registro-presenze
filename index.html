@@ -169,6 +169,8 @@ function Registro({ auth, onLogout }) {
   const [err, setErr] = useState(null);
   const [newCls, setNewCls] = useState("");
   const [newStu, setNewStu] = useState("");
+  const [editCls, setEditCls] = useState(null);
+  const [editStu, setEditStu] = useState(null);
 
   const loadAll = useCallback(async () => {
     try {
@@ -279,6 +281,18 @@ function Registro({ auth, onLogout }) {
 
   const remStu = async (id) => {
     try { await sb(`studenti?id=eq.${id}`, { method: "DELETE" }, tok); loadAll(); }
+    catch (e) { setErr("Errore: " + e.message); }
+  };
+
+  const renameCls = async (id, nome) => {
+    const n = (nome||"").trim(); if (!n) return;
+    try { await sb(`classi?id=eq.${id}`, { method: "PATCH", body: JSON.stringify({ nome:n }) }, tok); setEditCls(null); loadAll(); }
+    catch (e) { setErr("Errore: " + e.message); }
+  };
+
+  const renameStu = async (id, nome) => {
+    const n = (nome||"").trim(); if (!n) return;
+    try { await sb(`studenti?id=eq.${id}`, { method: "PATCH", body: JSON.stringify({ nome:n }) }, tok); setEditStu(null); loadAll(); }
     catch (e) { setErr("Errore: " + e.message); }
   };
 
@@ -444,9 +458,22 @@ function Registro({ auth, onLogout }) {
               {classes.length===0&&<div style={{padding:"12px 14px",fontSize:13,color:"var(--color-text-tertiary)"}}>Nessuna classe.</div>}
               {classes.map((c,i)=>(
                 <div key={c.id} style={{display:"flex",alignItems:"center",padding:"9px 14px",borderTop:i>0?"0.5px solid var(--color-border-tertiary)":"none",gap:8}}>
-                  <span style={{flex:1,fontSize:14}}>{c.nome}</span>
-                  <span style={{fontSize:12,color:"var(--color-text-tertiary)"}}>{students.filter(s=>s.classe_id===c.id).length} studenti</span>
-                  <button style={{...b,color:"#A32D2D",borderColor:"#F09595"}} onClick={()=>remCls(c.id)}>Rimuovi</button>
+                  {editCls && editCls.id===c.id ? (
+                    <>
+                      <input value={editCls.nome} autoFocus onChange={e=>setEditCls({...editCls,nome:e.target.value})}
+                        onKeyDown={e=>{if(e.key==="Enter")renameCls(c.id,editCls.nome);if(e.key==="Escape")setEditCls(null);}}
+                        style={{...inp,flex:1}} />
+                      <button style={bBlue} onClick={()=>renameCls(c.id,editCls.nome)}>Salva</button>
+                      <button style={b} onClick={()=>setEditCls(null)}>Annulla</button>
+                    </>
+                  ) : (
+                    <>
+                      <span style={{flex:1,fontSize:14}}>{c.nome}</span>
+                      <span style={{fontSize:12,color:"var(--color-text-tertiary)"}}>{students.filter(s=>s.classe_id===c.id).length} studenti</span>
+                      <button style={b} onClick={()=>setEditCls({id:c.id,nome:c.nome})}>Rinomina</button>
+                      <button style={{...b,color:"#A32D2D",borderColor:"#F09595"}} onClick={()=>remCls(c.id)}>Rimuovi</button>
+                    </>
+                  )}
                 </div>
               ))}
             </div>
@@ -461,9 +488,22 @@ function Registro({ auth, onLogout }) {
               <div style={{background:"var(--color-background-primary)",border:"0.5px solid var(--color-border-tertiary)",borderRadius:"var(--border-radius-lg)",overflow:"hidden"}}>
                 {clsStudents.length===0&&<div style={{padding:"12px 14px",fontSize:13,color:"var(--color-text-tertiary)"}}>Nessuno studente.</div>}
                 {clsStudents.map((s,i)=>(
-                  <div key={s.id} style={{display:"flex",alignItems:"center",padding:"9px 14px",borderTop:i>0?"0.5px solid var(--color-border-tertiary)":"none"}}>
-                    <span style={{flex:1,fontSize:14}}>{s.nome}</span>
-                    <button style={{...b,color:"#A32D2D",borderColor:"#F09595"}} onClick={()=>remStu(s.id)}>Rimuovi</button>
+                  <div key={s.id} style={{display:"flex",alignItems:"center",padding:"9px 14px",borderTop:i>0?"0.5px solid var(--color-border-tertiary)":"none",gap:8}}>
+                    {editStu && editStu.id===s.id ? (
+                      <>
+                        <input value={editStu.nome} autoFocus onChange={e=>setEditStu({...editStu,nome:e.target.value})}
+                          onKeyDown={e=>{if(e.key==="Enter")renameStu(s.id,editStu.nome);if(e.key==="Escape")setEditStu(null);}}
+                          style={{...inp,flex:1}} />
+                        <button style={bBlue} onClick={()=>renameStu(s.id,editStu.nome)}>Salva</button>
+                        <button style={b} onClick={()=>setEditStu(null)}>Annulla</button>
+                      </>
+                    ) : (
+                      <>
+                        <span style={{flex:1,fontSize:14}}>{s.nome}</span>
+                        <button style={b} onClick={()=>setEditStu({id:s.id,nome:s.nome})}>Rinomina</button>
+                        <button style={{...b,color:"#A32D2D",borderColor:"#F09595"}} onClick={()=>remStu(s.id)}>Rimuovi</button>
+                      </>
+                    )}
                   </div>
                 ))}
               </div>
