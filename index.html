@@ -123,7 +123,7 @@ function Registro() {
       if (next === null) {
         if (existing?.id) await sb(`presenze?id=eq.${existing.id}`, { method: "DELETE" });
       } else {
-        await sb("presenze", {
+        await sb("presenze?on_conflict=studente_id,data,fascia", {
           method: "POST",
           headers: { Prefer: "resolution=merge-duplicates" },
           body: JSON.stringify({ studente_id: sid, data: date, fascia: h, stato: next }),
@@ -136,7 +136,7 @@ function Registro() {
   const setAll = async (sid, status) => {
     try {
       const rows = HOURS.map(h => ({ studente_id: sid, data: date, fascia: h, stato: status }));
-      await sb("presenze", {
+      await sb("presenze?on_conflict=studente_id,data,fascia", {
         method: "POST",
         headers: { Prefer: "resolution=merge-duplicates" },
         body: JSON.stringify(rows),
