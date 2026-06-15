@@ -25,7 +25,7 @@
   * { box-sizing: border-box; }
   html, body { margin: 0; padding: 0; background: #faf9f5; }
   body { font-family: var(--font-sans); -webkit-text-size-adjust: 100%; }
-  input[type="date"], select { font-family: var(--font-sans); }
+  input[type="date"], input[type="month"], select { font-family: var(--font-sans); }
 </style>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/react/18.3.1/umd/react.production.min.js"></script>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/react-dom/18.3.1/umd/react-dom.production.min.js"></script>
@@ -116,7 +116,6 @@ function Login({ onLogin }) {
   };
 
   const card = {fontSize:14,padding:"7px 14px",borderRadius:"var(--border-radius-md)",cursor:"pointer",border:"0.5px solid var(--color-border-secondary)",background:"transparent",color:"var(--color-text-primary)"};
-  const cardA = {...card,background:"var(--color-background-secondary)",fontWeight:500,border:"0.5px solid var(--color-border-primary)"};
   const cardBlue = {...card,background:"#1F3864",color:"#fff",fontWeight:500,border:"0.5px solid #1F3864"};
 
   return (
@@ -161,6 +160,7 @@ function Registro({ auth, onLogout }) {
   const isMobile = useIsMobile();
   const [classes, setClasses] = useState([]);
   const [students, setStudents] = useState([]);
+  const [iscrizioni, setIscrizioni] = useState([]);
   const [presenze, setPresenze] = useState([]);
   const [selCls, setSelCls] = useState(null);
   const [date, setDate] = useState(new Date().toISOString().split("T")[0]);
@@ -169,18 +169,21 @@ function Registro({ auth, onLogout }) {
   const [err, setErr] = useState(null);
   const [newCls, setNewCls] = useState("");
   const [newStu, setNewStu] = useState("");
+  const [addExist, setAddExist] = useState("");
   const [editCls, setEditCls] = useState(null);
   const [editStu, setEditStu] = useState(null);
 
   const loadAll = useCallback(async () => {
     try {
       setErr(null);
-      const [cls, stu] = await Promise.all([
+      const [cls, stu, isc] = await Promise.all([
         sb("classi?select=*&order=nome", {}, tok),
         sb("studenti?select=*&order=nome", {}, tok),
+        sb("iscrizioni?select=*", {}, tok),
       ]);
       setClasses(cls || []);
       setStudents(stu || []);
+      setIscrizioni(isc || []);
       setSelCls(prev => prev || (cls && cls.length ? cls[0].id : null));
     } catch (e) {
       setErr("Errore di connessione al database: " + e.message);
@@ -202,7 +205,10 @@ function Registro({ auth, onLogout }) {
   useEffect(() => { loadPresenze(); }, [loadPresenze]);
 
   const cls = classes.find(c => c.id === selCls);
-  const clsStudents = students.filter(s => s.classe_id === selCls);
+  const clsStudentIds = iscrizioni.filter(i => i.classe_id === selCls).map(i => i.studente_id);
+  const clsStudents = students.filter(s => clsStudentIds.includes(s.id));
+  const otherStudents = students.filter(s => !clsStudentIds.includes(s.id));
+  const classNamesOf = (sid) => iscrizioni.filter(i=>i.studente_id===sid).map(i => classes.find(c=>c.id===i.classe_id)?.nome).filter(Boolean);
 
   const presKey = (sid, h) => presenze.find(p => p.studente_id === sid && p.fascia === h);
   const stateOf = (sid, h) => presKey(sid, h)?.stato || null;
@@ -269,19 +275,41 @@ function Registro({ auth, onLogout }) {
   const addStu = async () => {
     const nome = newStu.trim(); if (!nome || !cls) return;
     try {
-      await sb("studenti", { method: "POST", body: JSON.stringify({ nome, classe_id: cls.id }) }, tok);
+      const [s] = await sb("studenti", { method: "POST", headers: { Prefer: "return=representation" }, body: JSON.stringify({ nome }) }, tok);
+      if (s) await sb("iscrizioni", { method: "POST", body: JSON.stringify({ studente_id: s.id, classe_id: cls.id }) }, tok);
       setNewStu(""); loadAll();
     } catch (e) { setErr("Errore: " + e.message); }
   };
 
-  const remCls = async (id) => {
-    try { await sb(`classi?id=eq.${id}`, { method: "DELETE" }, tok); if (selCls===id) setSelCls(null); loadAll(); }
-    catch (e) { setErr("Errore: " + e.message); }
+  const enrollExisting = async () => {
+    if (!addExist || !cls) return;
+    try {
+      await sb("iscrizioni?on_conflict=studente_id,classe_id", { method: "POST", headers: { Prefer: "resolution=merge-duplicates" }, body: JSON.stringify({ studente_id: addExist, classe_id: cls.id }) }, tok);
+      setAddExist(""); loadAll();
+    } catch (e) { setErr("Errore: " + e.message); }
   };
 
-  const remStu = async (id) => {
-    try { await sb(`studenti?id=eq.${id}`, { method: "DELETE" }, tok); loadAll(); }
-    catch (e) { setErr("Errore: " + e.message); }
+  const remCls = async (id) => {
+    try {
+      const affected = iscrizioni.filter(x=>x.classe_id===id).map(x=>x.studente_id);
+      await sb(`classi?id=eq.${id}`, { method: "DELETE" }, tok);
+      for (const sid of affected) {
+        const others = iscrizioni.filter(x=>x.studente_id===sid && x.classe_id!==id);
+        if (others.length===0) { try { await sb(`studenti?id=eq.${sid}`, { method: "DELETE" }, tok); } catch(_){} }
+      }
+      if (selCls===id) setSelCls(null);
+      loadAll();
+    } catch (e) { setErr("Errore: " + e.message); }
+  };
+
+  const remStu = async (sid) => {
+    try {
+      const isc = iscrizioni.find(x=>x.studente_id===sid && x.classe_id===selCls);
+      if (isc) await sb(`iscrizioni?id=eq.${isc.id}`, { method: "DELETE" }, tok);
+      const others = iscrizioni.filter(x=>x.studente_id===sid && x.classe_id!==selCls);
+      if (others.length===0) await sb(`studenti?id=eq.${sid}`, { method: "DELETE" }, tok);
+      loadAll();
+    } catch (e) { setErr("Errore: " + e.message); }
   };
 
   const renameCls = async (id, nome) => {
@@ -334,7 +362,7 @@ function Registro({ auth, onLogout }) {
           {clsStudents.map(s=>(
             <div key={s.id} style={{background:"var(--color-background-primary)",border:"0.5px solid var(--color-border-tertiary)",borderRadius:"var(--border-radius-lg)",padding:"12px 12px 14px",marginBottom:10}}>
               <div style={{display:"flex",alignItems:"center",gap:8,marginBottom:10}}>
-                <span style={{flex:1,fontSize:15,fontWeight:500}}>{s.nome}</span>
+                <span style={{flex:1,fontSize:15,fontWeight:500}}>{s.nome}{classNamesOf(s.id).length>1 && <span style={{fontSize:11,fontWeight:400,color:"var(--color-text-tertiary)",marginLeft:6}}>· più classi</span>}</span>
                 {CYCLE.filter(Boolean).map(st=>(
                   <button key={st} onClick={()=>setAll(s.id,st)} title={`Tutta la giornata: ${st}`}
                     style={{width:30,height:30,borderRadius:6,cursor:"pointer",border:`1px solid ${ST[st].fg}55`,background:ST[st].bg,color:ST[st].fg,fontSize:13,fontWeight:600}}>
@@ -398,7 +426,7 @@ function Registro({ auth, onLogout }) {
               )}
               {clsStudents.map((s,i)=>(
                 <tr key={s.id} style={{borderTop:i>0?"0.5px solid var(--color-border-tertiary)":"none"}}>
-                  <td style={{padding:"6px 12px",fontSize:13}}>{s.nome}</td>
+                  <td style={{padding:"6px 12px",fontSize:13}}>{s.nome}{classNamesOf(s.id).length>1 && <span title="Iscritto a più classi" style={{fontSize:10,color:"var(--color-text-tertiary)",marginLeft:5}}>●</span>}</td>
                   <td style={{textAlign:"center",padding:"4px 2px"}}>
                     <div style={{display:"flex",justifyContent:"center",gap:3}}>
                       {CYCLE.filter(Boolean).map(st=>(
@@ -432,7 +460,7 @@ function Registro({ auth, onLogout }) {
           </table>
         </div>
         <div style={{fontSize:11,color:"var(--color-text-tertiary)",marginTop:8,paddingLeft:2}}>
-          La pallina <strong>G</strong> sulle assenze e sui ritardi indica se sono giustificati{isSegreteria?" — toccala per giustificare.":" (solo la segreteria può modificarli)."}
+          La pallina <strong>G</strong> sulle assenze e sui ritardi indica se sono giustificati{isSegreteria?" — toccala per giustificare.":" (solo la segreteria può modificarli)."} Il pallino <strong>●</strong> accanto a un nome segnala chi è iscritto a più classi (le presenze sono condivise).
         </div>
       </div>
     );
@@ -442,7 +470,7 @@ function Registro({ auth, onLogout }) {
     <>
       {view==="reg" && registerView()}
       {view==="stats" && cls && <StatsView cls={cls} clsStudents={clsStudents} date={date} tok={tok} />}
-      {view==="export" && isSegreteria && <ExportView classes={classes} students={students} tok={tok} />}
+      {view==="export" && isSegreteria && <ExportView classes={classes} students={students} iscrizioni={iscrizioni} tok={tok} />}
       {view==="manage" && isSegreteria && (
         <div>
           <div style={{marginBottom:20}}>
@@ -469,7 +497,7 @@ function Registro({ auth, onLogout }) {
                   ) : (
                     <>
                       <span style={{flex:1,fontSize:14}}>{c.nome}</span>
-                      <span style={{fontSize:12,color:"var(--color-text-tertiary)"}}>{students.filter(s=>s.classe_id===c.id).length} studenti</span>
+                      <span style={{fontSize:12,color:"var(--color-text-tertiary)"}}>{iscrizioni.filter(x=>x.classe_id===c.id).length} studenti</span>
                       <button style={b} onClick={()=>setEditCls({id:c.id,nome:c.nome})}>Rinomina</button>
                       <button style={{...b,color:"#A32D2D",borderColor:"#F09595"}} onClick={()=>remCls(c.id)}>Rimuovi</button>
                     </>
@@ -482,12 +510,23 @@ function Registro({ auth, onLogout }) {
             <div>
               <div style={{fontSize:13,fontWeight:500,marginBottom:8}}>Studenti in <em>{cls.nome}</em></div>
               <div style={{display:"flex",gap:8,marginBottom:10}}>
-                <input style={{...inp,flex:1,maxWidth:240}} placeholder="Cognome Nome" value={newStu} onChange={e=>setNewStu(e.target.value)} onKeyDown={e=>e.key==="Enter"&&addStu()} />
+                <input style={{...inp,flex:1,maxWidth:240}} placeholder="Cognome Nome (nuovo studente)" value={newStu} onChange={e=>setNewStu(e.target.value)} onKeyDown={e=>e.key==="Enter"&&addStu()} />
                 <button style={b} onClick={addStu}>Aggiungi</button>
               </div>
+              {otherStudents.length>0 && (
+                <div style={{display:"flex",gap:8,marginBottom:10}}>
+                  <select value={addExist} onChange={e=>setAddExist(e.target.value)} style={{...inp,flex:1,maxWidth:300}}>
+                    <option value="">+ Iscrivi uno studente già esistente…</option>
+                    {otherStudents.map(s=><option key={s.id} value={s.id}>{s.nome}{classNamesOf(s.id).length?` (${classNamesOf(s.id).join(", ")})`:""}</option>)}
+                  </select>
+                  <button style={b} disabled={!addExist} onClick={enrollExisting}>Iscrivi</button>
+                </div>
+              )}
               <div style={{background:"var(--color-background-primary)",border:"0.5px solid var(--color-border-tertiary)",borderRadius:"var(--border-radius-lg)",overflow:"hidden"}}>
                 {clsStudents.length===0&&<div style={{padding:"12px 14px",fontSize:13,color:"var(--color-text-tertiary)"}}>Nessuno studente.</div>}
-                {clsStudents.map((s,i)=>(
+                {clsStudents.map((s,i)=>{
+                  const altre = classNamesOf(s.id).filter(n=>n!==cls.nome);
+                  return (
                   <div key={s.id} style={{display:"flex",alignItems:"center",padding:"9px 14px",borderTop:i>0?"0.5px solid var(--color-border-tertiary)":"none",gap:8}}>
                     {editStu && editStu.id===s.id ? (
                       <>
@@ -499,13 +538,17 @@ function Registro({ auth, onLogout }) {
                       </>
                     ) : (
                       <>
-                        <span style={{flex:1,fontSize:14}}>{s.nome}</span>
+                        <span style={{flex:1,fontSize:14}}>{s.nome}{altre.length>0 && <span style={{fontSize:11,color:"var(--color-text-tertiary)",marginLeft:8}}>anche in {altre.join(", ")}</span>}</span>
                         <button style={b} onClick={()=>setEditStu({id:s.id,nome:s.nome})}>Rinomina</button>
-                        <button style={{...b,color:"#A32D2D",borderColor:"#F09595"}} onClick={()=>remStu(s.id)}>Rimuovi</button>
+                        <button style={{...b,color:"#A32D2D",borderColor:"#F09595"}} onClick={()=>remStu(s.id)} title={altre.length>0?"Toglie da questa classe":"Elimina lo studente"}>Rimuovi</button>
                       </>
                     )}
                   </div>
-                ))}
+                  );
+                })}
+              </div>
+              <div style={{fontSize:11,color:"var(--color-text-tertiary)",marginTop:8}}>
+                «Rimuovi» toglie lo studente da questa classe. Se non è iscritto ad altre classi, viene eliminato del tutto insieme alle sue presenze.
               </div>
             </div>
           )}
@@ -568,19 +611,93 @@ function Registro({ auth, onLogout }) {
   );
 }
 
-function ExportView({ classes, students, tok }) {
+function StatsView({ cls, clsStudents, date, tok }) {
+  const [stats, setStats] = useState(null);
+  const [period, setPeriod] = useState("month");
+  const [err, setErr] = useState(null);
+
+  useEffect(() => {
+    async function load() {
+      try {
+        setErr(null); setStats(null);
+        let filter = "";
+        if (period === "day") filter = `&data=eq.${date}`;
+        else if (period === "month") { const { start, endExcl } = monthRange(date.slice(0,7)); filter = `&data=gte.${start}&data=lt.${endExcl}`; }
+        const ids = clsStudents.map(s=>s.id);
+        if (!ids.length) { setStats([]); return; }
+        const p = await sb(`presenze?select=*&studente_id=in.(${ids.join(",")})${filter}`, {}, tok);
+        const map = {};
+        clsStudents.forEach(s => { map[s.id] = { ...s, presente:0, assente:0, ritardo:0, giustificate:0 }; });
+        (p||[]).forEach(r => {
+          if (!map[r.studente_id]) return;
+          map[r.studente_id][r.stato]++;
+          if (r.giustificato && (r.stato==='assente' || r.stato==='ritardo')) map[r.studente_id].giustificate++;
+        });
+        setStats(Object.values(map));
+      } catch (e) { setErr("Errore: " + e.message); }
+    }
+    load();
+  }, [period, date, cls.id, tok, clsStudents.length]);
+
+  const b = {fontSize:13,padding:"5px 12px",border:"0.5px solid var(--color-border-secondary)",borderRadius:"var(--border-radius-md)",background:"transparent",cursor:"pointer",color:"var(--color-text-primary)"};
+  const bBlue = {...b,background:"#1F3864",color:"#fff",fontWeight:500,border:"0.5px solid #1F3864"};
+  const th = {fontSize:11,color:"var(--color-text-secondary)",fontWeight:400,textTransform:"uppercase",letterSpacing:"0.04em",padding:"8px 12px"};
+
+  const labels = { day:"Giorno selezionato", month:"Mese corrente", all:"Tutto lo storico" };
+
+  return (
+    <React.Fragment>
+      <div style={{display:"flex",gap:6,marginBottom:12,alignItems:"center",flexWrap:"wrap"}}>
+        <span style={{fontSize:13,color:"var(--color-text-secondary)",marginRight:4}}>Periodo:</span>
+        {Object.entries(labels).map(([k,v])=>(
+          <button key={k} style={period===k?bBlue:b} onClick={()=>setPeriod(k)}>{v}</button>
+        ))}
+      </div>
+      {err && <div style={{fontSize:13,color:"var(--color-text-danger)",marginBottom:10}}>{err}</div>}
+      <div style={{fontSize:13,color:"var(--color-text-secondary)",marginBottom:10}}>Ore totali per <strong>{cls.nome}</strong> — {labels[period].toLowerCase()}.</div>
+      <div style={{background:"var(--color-background-primary)",border:"0.5px solid var(--color-border-tertiary)",borderRadius:"var(--border-radius-lg)",overflow:"auto"}}>
+        <table style={{width:"100%",borderCollapse:"collapse",minWidth:420}}>
+          <thead>
+            <tr style={{background:"var(--color-background-secondary)",borderBottom:"0.5px solid var(--color-border-tertiary)"}}>
+              <th style={{...th,textAlign:"left"}}>Studente</th>
+              <th style={{...th,textAlign:"center"}}>Ore presenti</th>
+              <th style={{...th,textAlign:"center"}}>Ore assenti</th>
+              <th style={{...th,textAlign:"center"}}>Ore ritardo</th>
+              <th style={{...th,textAlign:"center"}}>di cui giustif.</th>
+            </tr>
+          </thead>
+          <tbody>
+            {!stats && <tr><td colSpan={5} style={{padding:"16px 12px",fontSize:13,color:"var(--color-text-tertiary)"}}>Caricamento…</td></tr>}
+            {stats && stats.length===0 && <tr><td colSpan={5} style={{padding:"16px 12px",fontSize:13,color:"var(--color-text-tertiary)"}}>Nessuno studente.</td></tr>}
+            {stats && stats.map((s,i)=>(
+              <tr key={s.id} style={{borderTop:i>0?"0.5px solid var(--color-border-tertiary)":"none"}}>
+                <td style={{padding:"8px 12px",fontSize:14}}>{s.nome}</td>
+                <td style={{textAlign:"center",fontSize:14,color:"#3B6D11",fontWeight:500}}>{s.presente}</td>
+                <td style={{textAlign:"center",fontSize:14,color:"#A32D2D",fontWeight:500}}>{s.assente}</td>
+                <td style={{textAlign:"center",fontSize:14,color:"#854F0B",fontWeight:500}}>{s.ritardo}</td>
+                <td style={{textAlign:"center",fontSize:14,color:"#3B6D11",fontWeight:500}}>{s.giustificate}</td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
+    </React.Fragment>
+  );
+}
+
+function ExportView({ classes, students, iscrizioni, tok }) {
   const [clsId, setClsId] = useState(classes[0]?.id || "");
   const [stuId, setStuId] = useState("");
   const [month, setMonth] = useState(new Date().toISOString().slice(0,7));
   const [busy, setBusy] = useState(false);
   const [err, setErr] = useState(null);
 
-  const clsStudents = students.filter(s => s.classe_id === clsId);
+  const clsStudents = students.filter(s => iscrizioni.some(i => i.classe_id===clsId && i.studente_id===s.id));
 
   useEffect(() => {
     if (clsStudents.length && !clsStudents.find(s=>s.id===stuId)) setStuId(clsStudents[0].id);
     if (!clsStudents.length) setStuId("");
-  }, [clsId, students]);
+  }, [clsId, students, iscrizioni]);
 
   const studentObj = students.find(s=>s.id===stuId);
   const clsObj = classes.find(c=>c.id===clsId);
@@ -590,51 +707,6 @@ function ExportView({ classes, students, tok }) {
     const { start, endExcl } = monthRange(month);
     const p = await sb(`presenze?select=*&studente_id=eq.${stuId}&data=gte.${start}&data=lt.${endExcl}&order=data,fascia`, {}, tok);
     return p || [];
-  };
-
-  const doRiepilogo = async () => {
-    if (!stuId) return;
-    setErr(null); setBusy(true);
-    try {
-      const rows = await fetchRows();
-      let pr=0,as=0,ri=0,gi=0;
-      rows.forEach(r => {
-        if(r.stato==='presente')pr++; else if(r.stato==='assente')as++; else if(r.stato==='ritardo')ri++;
-        if(r.giustificato && (r.stato==='assente'||r.stato==='ritardo'))gi++;
-      });
-      const data = [{
-        Studente: studentObj?.nome || "",
-        Classe: clsObj?.nome || "",
-        Mese: month,
-        "Ore presenti": pr,
-        "Ore assenti": as,
-        "Ore ritardo": ri,
-        "di cui giustificate": gi,
-      }];
-      const ws = XLSX.utils.json_to_sheet(data);
-      const wb = XLSX.utils.book_new();
-      XLSX.utils.book_append_sheet(wb, ws, "Riepilogo");
-      XLSX.writeFile(wb, `riepilogo_${safeName}_${month}.xlsx`);
-    } catch(e){ setErr("Errore: "+e.message); } finally { setBusy(false); }
-  };
-
-  const doDettaglio = async () => {
-    if (!stuId) return;
-    setErr(null); setBusy(true);
-    try {
-      const rows = await fetchRows();
-      const data = rows.map(r => ({
-        Data: r.data,
-        Fascia: `${r.fascia}–${HOUR_END[r.fascia]||""}`,
-        Stato: r.stato,
-        Giustificato: r.giustificato ? "Sì" : "No",
-      }));
-      if (!data.length) data.push({ Data:"", Fascia:"", Stato:"Nessun dato nel mese", Giustificato:"" });
-      const ws = XLSX.utils.json_to_sheet(data);
-      const wb = XLSX.utils.book_new();
-      XLSX.utils.book_append_sheet(wb, ws, "Dettaglio");
-      XLSX.writeFile(wb, `dettaglio_${safeName}_${month}.xlsx`);
-    } catch(e){ setErr("Errore: "+e.message); } finally { setBusy(false); }
   };
 
   const MESE_LBL = (() => { const [y,m] = month.split("-"); return `${MESI[parseInt(m,10)-1]||""} ${y}`; })();
@@ -697,6 +769,51 @@ ${inner}
     } catch(e){ setErr("Errore: "+e.message); try{w.close();}catch(_){} } finally { setBusy(false); }
   };
 
+  const doRiepilogo = async () => {
+    if (!stuId) return;
+    setErr(null); setBusy(true);
+    try {
+      const rows = await fetchRows();
+      let pr=0,as=0,ri=0,gi=0;
+      rows.forEach(r => {
+        if(r.stato==='presente')pr++; else if(r.stato==='assente')as++; else if(r.stato==='ritardo')ri++;
+        if(r.giustificato && (r.stato==='assente'||r.stato==='ritardo'))gi++;
+      });
+      const data = [{
+        Studente: studentObj?.nome || "",
+        Classe: clsObj?.nome || "",
+        Mese: month,
+        "Ore presenti": pr,
+        "Ore assenti": as,
+        "Ore ritardo": ri,
+        "di cui giustificate": gi,
+      }];
+      const ws = XLSX.utils.json_to_sheet(data);
+      const wb = XLSX.utils.book_new();
+      XLSX.utils.book_append_sheet(wb, ws, "Riepilogo");
+      XLSX.writeFile(wb, `riepilogo_${safeName}_${month}.xlsx`);
+    } catch(e){ setErr("Errore: "+e.message); } finally { setBusy(false); }
+  };
+
+  const doDettaglio = async () => {
+    if (!stuId) return;
+    setErr(null); setBusy(true);
+    try {
+      const rows = await fetchRows();
+      const data = rows.map(r => ({
+        Data: r.data,
+        Fascia: `${r.fascia}–${HOUR_END[r.fascia]||""}`,
+        Stato: r.stato,
+        Giustificato: r.giustificato ? "Sì" : "No",
+      }));
+      if (!data.length) data.push({ Data:"", Fascia:"", Stato:"Nessun dato nel mese", Giustificato:"" });
+      const ws = XLSX.utils.json_to_sheet(data);
+      const wb = XLSX.utils.book_new();
+      XLSX.utils.book_append_sheet(wb, ws, "Dettaglio");
+      XLSX.writeFile(wb, `dettaglio_${safeName}_${month}.xlsx`);
+    } catch(e){ setErr("Errore: "+e.message); } finally { setBusy(false); }
+  };
+
   const lbl = {fontSize:12,color:"var(--color-text-tertiary)",textTransform:"uppercase",letterSpacing:"0.05em",marginBottom:6};
   const sel = {width:"100%",maxWidth:320,fontSize:14,padding:"8px 10px",borderRadius:"var(--border-radius-md)",border:"0.5px solid var(--color-border-secondary)",background:"var(--color-background-primary)",color:"var(--color-text-primary)"};
   const dlBtn = {fontSize:14,padding:"9px 16px",borderRadius:"var(--border-radius-md)",cursor:stuId&&!busy?"pointer":"default",border:"none",background:stuId&&!busy?"#1F3864":"var(--color-background-secondary)",color:stuId&&!busy?"#fff":"var(--color-text-tertiary)",fontWeight:500};
@@ -704,7 +821,7 @@ ${inner}
 
   return (
     <div style={{maxWidth:340}}>
-      <div style={{fontSize:13,color:"var(--color-text-secondary)",marginBottom:16}}>Genera un archivio Excel mensile per un singolo studente.</div>
+      <div style={{fontSize:13,color:"var(--color-text-secondary)",marginBottom:16}}>Genera un archivio mensile per un singolo studente.</div>
 
       <div style={{marginBottom:14}}>
         <div style={lbl}>Classe</div>
@@ -742,84 +859,9 @@ ${inner}
       </div>
 
       <div style={{fontSize:11,color:"var(--color-text-tertiary)",marginTop:14}}>
-        Il <strong>riepilogo</strong> contiene i totali del mese (presenze, assenze, ritardi, di cui giustificate). Il <strong>dettaglio</strong> elenca ogni singola fascia oraria registrata.
+        Il <strong>riepilogo</strong> contiene i totali del mese; il <strong>dettaglio</strong> elenca ogni singola fascia oraria registrata.
       </div>
     </div>
-  );
-}
-
-function StatsView({ cls, clsStudents, date, tok }) {
-  const [stats, setStats] = useState(null);
-  const [period, setPeriod] = useState("month");
-  const [err, setErr] = useState(null);
-
-  useEffect(() => {
-    async function load() {
-      try {
-        setErr(null); setStats(null);
-        let filter = "";
-        if (period === "day") filter = `&data=eq.${date}`;
-        else if (period === "month") { const { start, endExcl } = monthRange(date.slice(0,7)); filter = `&data=gte.${start}&data=lt.${endExcl}`; }
-        const ids = clsStudents.map(s=>s.id);
-        if (!ids.length) { setStats([]); return; }
-        const p = await sb(`presenze?select=*&studente_id=in.(${ids.join(",")})${filter}`, {}, tok);
-        const map = {};
-        clsStudents.forEach(s => { map[s.id] = { ...s, presente:0, assente:0, ritardo:0, giustificate:0 }; });
-        (p||[]).forEach(r => {
-          if (!map[r.studente_id]) return;
-          map[r.studente_id][r.stato]++;
-          if (r.giustificato && (r.stato==='assente' || r.stato==='ritardo')) map[r.studente_id].giustificate++;
-        });
-        setStats(Object.values(map));
-      } catch (e) { setErr("Errore: " + e.message); }
-    }
-    load();
-  }, [period, date, cls.id, tok]);
-
-  const b = {fontSize:13,padding:"5px 12px",border:"0.5px solid var(--color-border-secondary)",borderRadius:"var(--border-radius-md)",background:"transparent",cursor:"pointer",color:"var(--color-text-primary)"};
-  const bA = {...b,background:"var(--color-background-secondary)",fontWeight:500,border:"0.5px solid var(--color-border-primary)"};
-  const bBlue = {...b,background:"#1F3864",color:"#fff",fontWeight:500,border:"0.5px solid #1F3864"};
-  const th = {fontSize:11,color:"var(--color-text-secondary)",fontWeight:400,textTransform:"uppercase",letterSpacing:"0.04em",padding:"8px 12px"};
-
-  const labels = { day:"Giorno selezionato", month:"Mese corrente", all:"Tutto lo storico" };
-
-  return (
-    <React.Fragment>
-      <div style={{display:"flex",gap:6,marginBottom:12,alignItems:"center",flexWrap:"wrap"}}>
-        <span style={{fontSize:13,color:"var(--color-text-secondary)",marginRight:4}}>Periodo:</span>
-        {Object.entries(labels).map(([k,v])=>(
-          <button key={k} style={period===k?bBlue:b} onClick={()=>setPeriod(k)}>{v}</button>
-        ))}
-      </div>
-      {err && <div style={{fontSize:13,color:"var(--color-text-danger)",marginBottom:10}}>{err}</div>}
-      <div style={{fontSize:13,color:"var(--color-text-secondary)",marginBottom:10}}>Ore totali per <strong>{cls.nome}</strong> — {labels[period].toLowerCase()}.</div>
-      <div style={{background:"var(--color-background-primary)",border:"0.5px solid var(--color-border-tertiary)",borderRadius:"var(--border-radius-lg)",overflow:"auto"}}>
-        <table style={{width:"100%",borderCollapse:"collapse",minWidth:420}}>
-          <thead>
-            <tr style={{background:"var(--color-background-secondary)",borderBottom:"0.5px solid var(--color-border-tertiary)"}}>
-              <th style={{...th,textAlign:"left"}}>Studente</th>
-              <th style={{...th,textAlign:"center"}}>Ore presenti</th>
-              <th style={{...th,textAlign:"center"}}>Ore assenti</th>
-              <th style={{...th,textAlign:"center"}}>Ore ritardo</th>
-              <th style={{...th,textAlign:"center"}}>di cui giustif.</th>
-            </tr>
-          </thead>
-          <tbody>
-            {!stats && <tr><td colSpan={5} style={{padding:"16px 12px",fontSize:13,color:"var(--color-text-tertiary)"}}>Caricamento…</td></tr>}
-            {stats && stats.length===0 && <tr><td colSpan={5} style={{padding:"16px 12px",fontSize:13,color:"var(--color-text-tertiary)"}}>Nessuno studente.</td></tr>}
-            {stats && stats.map((s,i)=>(
-              <tr key={s.id} style={{borderTop:i>0?"0.5px solid var(--color-border-tertiary)":"none"}}>
-                <td style={{padding:"8px 12px",fontSize:14}}>{s.nome}</td>
-                <td style={{textAlign:"center",fontSize:14,color:"#3B6D11",fontWeight:500}}>{s.presente}</td>
-                <td style={{textAlign:"center",fontSize:14,color:"#A32D2D",fontWeight:500}}>{s.assente}</td>
-                <td style={{textAlign:"center",fontSize:14,color:"#854F0B",fontWeight:500}}>{s.ritardo}</td>
-                <td style={{textAlign:"center",fontSize:14,color:"#3B6D11",fontWeight:500}}>{s.giustificate}</td>
-              </tr>
-            ))}
-          </tbody>
-        </table>
-      </div>
-    </React.Fragment>
   );
 }
 
