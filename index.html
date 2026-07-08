@@ -47,6 +47,7 @@ const RUOLI = {
 };
 
 const HOURS = ['08:30','09:30','10:30','11:30','12:30','13:30'];
+const FASCE_GIORNO_ASSENZA = ['08:30','09:30','10:30','11:30']; // 08:30→12:30: se tutte e 4 assenti, il giorno conta come assenza
 const HOUR_END = {'08:30':'09:30','09:30':'10:30','10:30':'11:30','11:30':'12:30','12:30':'13:30','13:30':'14:30'};
 const MESI = ["gennaio","febbraio","marzo","aprile","maggio","giugno","luglio","agosto","settembre","ottobre","novembre","dicembre"];
 const CYCLE = [null,'presente','assente','ritardo'];
@@ -678,18 +679,25 @@ function StatsView({ cls, clsStudents, date, tok }) {
         const p = await sb(`presenze?select=*&studente_id=in.(${ids.join(",")})${filter}`, {}, tok);
         const map = {};
         const absPerDay = {};
-        clsStudents.forEach(s => { map[s.id] = { ...s, presente:0, assente:0, ritardo:0, giustificate:0, giorniAssenza:0 }; });
+        clsStudents.forEach(s => { map[s.id] = { ...s, presente:0, assente:0, ritardo:0, giustificate:0, giorniAssenza:0, giorniGiustificati:0 }; });
         (p||[]).forEach(r => {
           if (!map[r.studente_id]) return;
           map[r.studente_id][r.stato]++;
           if (r.giustificato && (r.stato==='assente' || r.stato==='ritardo')) map[r.studente_id].giustificate++;
           if (r.stato==='assente') {
             absPerDay[r.studente_id] = absPerDay[r.studente_id] || {};
-            absPerDay[r.studente_id][r.data] = (absPerDay[r.studente_id][r.data]||0)+1;
+            const e = absPerDay[r.studente_id][r.data] = absPerDay[r.studente_id][r.data] || { mattina:0, nonGiust:false };
+            if (FASCE_GIORNO_ASSENZA.includes(r.fascia)) e.mattina++;
+            if (!r.giustificato) e.nonGiust = true;
           }
         });
         Object.values(map).forEach(s => {
-          s.giorniAssenza = Object.values(absPerDay[s.id]||{}).filter(n => n === HOURS.length).length;
+          Object.values(absPerDay[s.id]||{}).forEach(e => {
+            if (e.mattina === FASCE_GIORNO_ASSENZA.length) {
+              s.giorniAssenza++;
+              if (!e.nonGiust) s.giorniGiustificati++;
+            }
+          });
         });
         setStats(Object.values(map));
       } catch (e) { setErr("Errore: " + e.message); }
@@ -721,19 +729,21 @@ function StatsView({ cls, clsStudents, date, tok }) {
               <th style={{...th,textAlign:"center"}}>Ore presenti</th>
               <th style={{...th,textAlign:"center"}}>Ore assenti</th>
               <th style={{...th,textAlign:"center"}}>Giorni assenza</th>
+              <th style={{...th,textAlign:"center"}}>Giorni giustif.</th>
               <th style={{...th,textAlign:"center"}}>Ore ritardo</th>
-              <th style={{...th,textAlign:"center"}}>di cui giustif.</th>
+              <th style={{...th,textAlign:"center"}}>Ore giustif.</th>
             </tr>
           </thead>
           <tbody>
-            {!stats && <tr><td colSpan={6} style={{padding:"16px 12px",fontSize:13,color:"var(--color-text-tertiary)"}}>Caricamento…</td></tr>}
-            {stats && stats.length===0 && <tr><td colSpan={6} style={{padding:"16px 12px",fontSize:13,color:"var(--color-text-tertiary)"}}>Nessuno studente.</td></tr>}
+            {!stats && <tr><td colSpan={7} style={{padding:"16px 12px",fontSize:13,color:"var(--color-text-tertiary)"}}>Caricamento…</td></tr>}
+            {stats && stats.length===0 && <tr><td colSpan={7} style={{padding:"16px 12px",fontSize:13,color:"var(--color-text-tertiary)"}}>Nessuno studente.</td></tr>}
             {stats && stats.map((s,i)=>(
               <tr key={s.id} style={{borderTop:i>0?"0.5px solid var(--color-border-tertiary)":"none"}}>
                 <td style={{padding:"8px 12px",fontSize:14}}>{s.nome}</td>
                 <td style={{textAlign:"center",fontSize:14,color:"#3B6D11",fontWeight:500}}>{s.presente}</td>
                 <td style={{textAlign:"center",fontSize:14,color:"#A32D2D",fontWeight:500}}>{s.assente}</td>
                 <td style={{textAlign:"center",fontSize:14,color:"#A32D2D",fontWeight:600}}>{s.giorniAssenza}</td>
+                <td style={{textAlign:"center",fontSize:14,color:"#3B6D11",fontWeight:600}}>{s.giorniGiustificati}</td>
                 <td style={{textAlign:"center",fontSize:14,color:"#854F0B",fontWeight:500}}>{s.ritardo}</td>
                 <td style={{textAlign:"center",fontSize:14,color:"#3B6D11",fontWeight:500}}>{s.giustificate}</td>
               </tr>
@@ -810,10 +820,11 @@ ${inner}
       const rows = await fetchRows();
       let pr=0,as=0,ri=0,gi=0;
       const absPerDay = {};
-      rows.forEach(r => { if(r.stato==='presente')pr++; else if(r.stato==='assente'){as++; absPerDay[r.data]=(absPerDay[r.data]||0)+1;} else if(r.stato==='ritardo')ri++; if(r.giustificato&&(r.stato==='assente'||r.stato==='ritardo'))gi++; });
-      const gg = Object.values(absPerDay).filter(n => n === HOURS.length).length;
-      const inner = `<table><tr><th>Ore presenti</th><th>Ore assenti</th><th>Giorni di assenza</th><th>Ore ritardo</th><th>di cui giustificate</th></tr><tr><td>${pr}</td><td>${as}</td><td>${gg}</td><td>${ri}</td><td>${gi}</td></tr></table>
-<div style="font-size:11px;color:#888;margin-top:8px">Un giorno di assenza corrisponde a una giornata con tutte e ${HOURS.length} le fasce orarie segnate come assente.</div>`;
+      rows.forEach(r => { if(r.stato==='presente')pr++; else if(r.stato==='assente'){as++; const e = absPerDay[r.data] = absPerDay[r.data] || {mattina:0,nonGiust:false}; if(FASCE_GIORNO_ASSENZA.includes(r.fascia)) e.mattina++; if(!r.giustificato) e.nonGiust = true;} else if(r.stato==='ritardo')ri++; if(r.giustificato&&(r.stato==='assente'||r.stato==='ritardo'))gi++; });
+      let gg=0, ggG=0;
+      Object.values(absPerDay).forEach(e => { if(e.mattina===FASCE_GIORNO_ASSENZA.length){ gg++; if(!e.nonGiust) ggG++; } });
+      const inner = `<table><tr><th>Ore presenti</th><th>Ore assenti</th><th>Giorni di assenza</th><th>Giorni giustificati</th><th>Ore ritardo</th><th>Ore giustificate</th></tr><tr><td>${pr}</td><td>${as}</td><td>${gg}</td><td>${ggG}</td><td>${ri}</td><td>${gi}</td></tr></table>
+<div style="font-size:11px;color:#888;margin-top:8px">Un giorno di assenza corrisponde a una giornata con tutte e 4 le fasce orarie 08:30–12:30 segnate come assente. Un giorno è giustificato se tutte le assenze registrate in quella giornata risultano giustificate.</div>`;
       w.document.open(); w.document.write(reportHtml("Riepilogo mensile", inner)); w.document.close();
     } catch(e){ setErr("Errore: "+e.message); try{w.close();}catch(_){} } finally { setBusy(false); }
   };
@@ -840,10 +851,13 @@ ${inner}
       let pr=0,as=0,ri=0,gi=0;
       const absPerDay = {};
       rows.forEach(r => {
-        if(r.stato==='presente')pr++; else if(r.stato==='assente'){as++; absPerDay[r.data]=(absPerDay[r.data]||0)+1;} else if(r.stato==='ritardo')ri++;
+        if(r.stato==='presente')pr++;
+        else if(r.stato==='assente'){as++; const e = absPerDay[r.data] = absPerDay[r.data] || {mattina:0,nonGiust:false}; if(FASCE_GIORNO_ASSENZA.includes(r.fascia)) e.mattina++; if(!r.giustificato) e.nonGiust = true;}
+        else if(r.stato==='ritardo')ri++;
         if(r.giustificato && (r.stato==='assente'||r.stato==='ritardo'))gi++;
       });
-      const gg = Object.values(absPerDay).filter(n => n === HOURS.length).length;
+      let gg=0, ggG=0;
+      Object.values(absPerDay).forEach(e => { if(e.mattina===FASCE_GIORNO_ASSENZA.length){ gg++; if(!e.nonGiust) ggG++; } });
       const data = [{
         Studente: studentObj?.nome || "",
         Classe: clsObj?.nome || "",
@@ -851,8 +865,9 @@ ${inner}
         "Ore presenti": pr,
         "Ore assenti": as,
         "Giorni di assenza": gg,
+        "Giorni giustificati": ggG,
         "Ore ritardo": ri,
-        "di cui giustificate": gi,
+        "Ore giustificate": gi,
       }];
       const ws = XLSX.utils.json_to_sheet(data);
       const wb = XLSX.utils.book_new();
