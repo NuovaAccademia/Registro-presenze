@@ -1,6 +1,6 @@
 {
   "name": "Registro presenze — Nuova Accademia",
-  "short_name": "Registro",
+  "short_name": "Registro presenze",
   "start_url": "/",
   "display": "standalone",
   "background_color": "#faf9f5",
