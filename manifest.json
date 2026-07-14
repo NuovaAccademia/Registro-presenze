@@ -1,0 +1,12 @@
+{
+  "name": "Registro presenze — Nuova Accademia",
+  "short_name": "Registro",
+  "start_url": "/",
+  "display": "standalone",
+  "background_color": "#faf9f5",
+  "theme_color": "#1F3864",
+  "icons": [
+    { "src": "icona.png", "sizes": "512x512", "type": "image/png" },
+    { "src": "icona.png", "sizes": "192x192", "type": "image/png" }
+  ]
+}
