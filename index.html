@@ -55,6 +55,7 @@ const RUOLI = {
 const HOURS = ['08:30','09:30','10:30','11:30','12:30','13:30'];
 const HOUR_END = {'08:30':'09:30','09:30':'10:30','10:30':'11:30','11:30':'12:30','12:30':'13:30','13:30':'14:30'};
 const MESI = ["gennaio","febbraio","marzo","aprile","maggio","giugno","luglio","agosto","settembre","ottobre","novembre","dicembre"];
+const MORNING = ['08:30','09:30','10:30','11:30'];
 const CYCLE = [null,'presente','assente','ritardo'];
 const ST = {
   presente: { bg:'#EAF3DE', fg:'#3B6D11', l:'P' },
@@ -270,6 +271,21 @@ function Registro({ auth, onLogout }) {
     } catch (e) { setErr("Errore: " + e.message); }
   };
 
+  const giustDay = async (sid) => {
+    if (!isSegreteria) return;
+    const rows = presenze.filter(p => p.studente_id===sid && (p.stato==='assente' || p.stato==='ritardo'));
+    if (!rows.length) return;
+    const newVal = !rows.every(r => r.giustificato);
+    try {
+      await sb("presenze?on_conflict=studente_id,data,fascia", {
+        method: "POST",
+        headers: { Prefer: "resolution=merge-duplicates" },
+        body: JSON.stringify(rows.map(r => ({ studente_id: sid, data: date, fascia: r.fascia, stato: r.stato, giustificato: newVal }))),
+      }, tok);
+      loadPresenze();
+    } catch (e) { setErr("Errore: " + e.message); loadPresenze(); }
+  };
+
   const addCls = async () => {
     const nome = newCls.trim(); if (!nome) return;
     try {
@@ -375,6 +391,12 @@ function Registro({ auth, onLogout }) {
                     {ST[st].l}
                   </button>
                 ))}
+                {isSegreteria && (
+                  <button onClick={()=>giustDay(s.id)} title="Giustifica tutta la giornata"
+                    style={{width:30,height:30,borderRadius:6,cursor:"pointer",border:"1px solid #3B6D11",background:"#fff",color:"#3B6D11",fontSize:13,fontWeight:600}}>
+                    G
+                  </button>
+                )}
               </div>
               <div style={{display:"grid",gridTemplateColumns:"repeat(3,1fr)",gap:8}}>
                 {HOURS.map(h=>{
@@ -441,6 +463,12 @@ function Registro({ auth, onLogout }) {
                           {ST[st].l}
                         </button>
                       ))}
+                      {isSegreteria && (
+                        <button onClick={()=>giustDay(s.id)} title="Giustifica tutte le assenze/ritardi della giornata"
+                          style={{width:24,height:24,borderRadius:4,cursor:"pointer",border:"1px solid #3B6D11",background:"#fff",color:"#3B6D11",fontSize:11,fontWeight:600}}>
+                          G
+                        </button>
+                      )}
                     </div>
                   </td>
                   {HOURS.map(h=>{
@@ -633,11 +661,23 @@ function StatsView({ cls, clsStudents, date, tok }) {
         if (!ids.length) { setStats([]); return; }
         const p = await sb(`presenze?select=*&studente_id=in.(${ids.join(",")})${filter}`, {}, tok);
         const map = {};
-        clsStudents.forEach(s => { map[s.id] = { ...s, presente:0, assente:0, ritardo:0, giustificate:0 }; });
+        clsStudents.forEach(s => { map[s.id] = { ...s, presente:0, assente:0, ritardo:0, giustificate:0, giorniAss:0, giorniGiust:0 }; });
+        const byDay = {};
         (p||[]).forEach(r => {
           if (!map[r.studente_id]) return;
           map[r.studente_id][r.stato]++;
           if (r.giustificato && (r.stato==='assente' || r.stato==='ritardo')) map[r.studente_id].giustificate++;
+          byDay[r.studente_id] = byDay[r.studente_id] || {};
+          (byDay[r.studente_id][r.data] = byDay[r.studente_id][r.data] || []).push(r);
+        });
+        Object.entries(byDay).forEach(([sid, days]) => {
+          Object.values(days).forEach(rows => {
+            const morningAbs = rows.filter(r => MORNING.includes(r.fascia) && r.stato==='assente');
+            if (morningAbs.length >= 4) {
+              map[sid].giorniAss++;
+              if (morningAbs.every(r => r.giustificato)) map[sid].giorniGiust++;
+            }
+          });
         });
         setStats(Object.values(map));
       } catch (e) { setErr("Errore: " + e.message); }
@@ -662,7 +702,7 @@ function StatsView({ cls, clsStudents, date, tok }) {
       {err && <div style={{fontSize:13,color:"var(--color-text-danger)",marginBottom:10}}>{err}</div>}
       <div style={{fontSize:13,color:"var(--color-text-secondary)",marginBottom:10}}>Ore totali per <strong>{cls.nome}</strong> — {labels[period].toLowerCase()}.</div>
       <div style={{background:"var(--color-background-primary)",border:"0.5px solid var(--color-border-tertiary)",borderRadius:"var(--border-radius-lg)",overflow:"auto"}}>
-        <table style={{width:"100%",borderCollapse:"collapse",minWidth:420}}>
+        <table style={{width:"100%",borderCollapse:"collapse",minWidth:560}}>
           <thead>
             <tr style={{background:"var(--color-background-secondary)",borderBottom:"0.5px solid var(--color-border-tertiary)"}}>
               <th style={{...th,textAlign:"left"}}>Studente</th>
@@ -670,11 +710,13 @@ function StatsView({ cls, clsStudents, date, tok }) {
               <th style={{...th,textAlign:"center"}}>Ore assenti</th>
               <th style={{...th,textAlign:"center"}}>Ore ritardo</th>
               <th style={{...th,textAlign:"center"}}>di cui giustif.</th>
+              <th style={{...th,textAlign:"center"}}>Giorni assenza</th>
+              <th style={{...th,textAlign:"center"}}>Giorni giustif.</th>
             </tr>
           </thead>
           <tbody>
-            {!stats && <tr><td colSpan={5} style={{padding:"16px 12px",fontSize:13,color:"var(--color-text-tertiary)"}}>Caricamento…</td></tr>}
-            {stats && stats.length===0 && <tr><td colSpan={5} style={{padding:"16px 12px",fontSize:13,color:"var(--color-text-tertiary)"}}>Nessuno studente.</td></tr>}
+            {!stats && <tr><td colSpan={7} style={{padding:"16px 12px",fontSize:13,color:"var(--color-text-tertiary)"}}>Caricamento…</td></tr>}
+            {stats && stats.length===0 && <tr><td colSpan={7} style={{padding:"16px 12px",fontSize:13,color:"var(--color-text-tertiary)"}}>Nessuno studente.</td></tr>}
             {stats && stats.map((s,i)=>(
               <tr key={s.id} style={{borderTop:i>0?"0.5px solid var(--color-border-tertiary)":"none"}}>
                 <td style={{padding:"8px 12px",fontSize:14}}>{s.nome}</td>
@@ -682,6 +724,8 @@ function StatsView({ cls, clsStudents, date, tok }) {
                 <td style={{textAlign:"center",fontSize:14,color:"#A32D2D",fontWeight:500}}>{s.assente}</td>
                 <td style={{textAlign:"center",fontSize:14,color:"#854F0B",fontWeight:500}}>{s.ritardo}</td>
                 <td style={{textAlign:"center",fontSize:14,color:"#3B6D11",fontWeight:500}}>{s.giustificate}</td>
+                <td style={{textAlign:"center",fontSize:14,color:"#A32D2D",fontWeight:500}}>{s.giorniAss}</td>
+                <td style={{textAlign:"center",fontSize:14,color:"#3B6D11",fontWeight:500}}>{s.giorniGiust}</td>
               </tr>
             ))}
           </tbody>
