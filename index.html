@@ -211,6 +211,19 @@ function Registro({ auth, onLogout }) {
   useEffect(() => { loadAll(); }, [loadAll]);
   useEffect(() => { loadPresenze(); }, [loadPresenze]);
 
+  useEffect(() => {
+    const refresh = () => { if (!document.hidden) loadPresenze(); };
+    const onVis = () => { if (!document.hidden) { loadPresenze(); loadAll(); } };
+    window.addEventListener("focus", refresh);
+    document.addEventListener("visibilitychange", onVis);
+    const t = setInterval(refresh, 10000);
+    return () => {
+      window.removeEventListener("focus", refresh);
+      document.removeEventListener("visibilitychange", onVis);
+      clearInterval(t);
+    };
+  }, [loadPresenze, loadAll]);
+
   const cls = classes.find(c => c.id === selCls);
   const clsStudentIds = iscrizioni.filter(i => i.classe_id === selCls).map(i => i.studente_id);
   const clsStudents = students.filter(s => clsStudentIds.includes(s.id));
