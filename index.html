@@ -13,7 +13,6 @@
 <style>
   :root {
     --font-sans: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
-    --font-mono: ui-monospace, SFMono-Regular, Menlo, monospace;
     --color-text-primary: #1a1a18;
     --color-text-secondary: #55534d;
     --color-text-tertiary: #8a887f;
@@ -42,7 +41,7 @@
 <div id="root"></div>
 
 <script type="text/babel">
-const { useState, useEffect, useCallback } = React;
+const { useState, useEffect, useCallback, useRef } = React;
 
 const SUPABASE_URL = "https://esowfbptahnzxbathqzf.supabase.co";
 const SUPABASE_KEY = "sb_publishable_lil3SYpFe57jbIDNgGryNw_a-tU29Cl";
@@ -54,16 +53,19 @@ const RUOLI = {
 
 const HOURS = ['08:30','09:30','10:30','11:30','12:30','13:30'];
 const HOUR_END = {'08:30':'09:30','09:30':'10:30','10:30':'11:30','11:30':'12:30','12:30':'13:30','13:30':'14:30'};
-const MESI = ["gennaio","febbraio","marzo","aprile","maggio","giugno","luglio","agosto","settembre","ottobre","novembre","dicembre"];
 const MORNING = ['08:30','09:30','10:30','11:30'];
+const MESI = ["gennaio","febbraio","marzo","aprile","maggio","giugno","luglio","agosto","settembre","ottobre","novembre","dicembre"];
 const CYCLE = [null,'presente','assente','ritardo'];
 const ST = {
   presente: { bg:'#EAF3DE', fg:'#3B6D11', l:'P' },
   assente:  { bg:'#FCEBEB', fg:'#A32D2D', l:'A' },
   ritardo:  { bg:'#FAEEDA', fg:'#854F0B', l:'R' },
 };
+const PRES_COLS = "id,studente_id,fascia,stato,giustificato";
 
-async function sb(path, opts = {}, token) {
+/* ---------- comunicazione con Supabase ---------- */
+
+async function raw(path, opts = {}, token) {
   const res = await fetch(`${SUPABASE_URL}/rest/v1/${path}`, {
     ...opts,
     headers: {
@@ -78,6 +80,55 @@ async function sb(path, opts = {}, token) {
   return txt ? JSON.parse(txt) : null;
 }
 
+/* ---------- gestione sessione con rinnovo automatico ---------- */
+
+let SESS = null;
+let onSessionLost = null;
+let refreshing = null;
+
+function setSession(d) {
+  SESS = {
+    token: d.access_token,
+    refresh: d.refresh_token,
+    expiresAt: Date.now() + ((d.expires_in || 3600) * 1000),
+  };
+}
+function clearSession() { SESS = null; }
+
+async function renewSession() {
+  if (!SESS || !SESS.refresh) throw new Error("Sessione assente");
+  if (refreshing) return refreshing;
+  refreshing = (async () => {
+    const res = await fetch(`${SUPABASE_URL}/auth/v1/token?grant_type=refresh_token`, {
+      method: "POST",
+      headers: { apikey: SUPABASE_KEY, "Content-Type": "application/json" },
+      body: JSON.stringify({ refresh_token: SESS.refresh }),
+    });
+    if (!res.ok) {
+      clearSession();
+      if (onSessionLost) onSessionLost();
+      throw new Error("Sessione scaduta");
+    }
+    setSession(await res.json());
+  })();
+  try { await refreshing; } finally { refreshing = null; }
+}
+
+// Usata da tutta l'app: rinnova il token prima che scada e riprova in caso di 401
+async function api(path, opts = {}) {
+  if (!SESS) throw new Error("Sessione scaduta");
+  if (Date.now() > SESS.expiresAt - 120000) await renewSession();
+  try {
+    return await raw(path, opts, SESS.token);
+  } catch (e) {
+    if (String(e.message).startsWith("401")) {
+      await renewSession();
+      return await raw(path, opts, SESS.token);
+    }
+    throw e;
+  }
+}
+
 async function signIn(email, password) {
   const res = await fetch(`${SUPABASE_URL}/auth/v1/token?grant_type=password`, {
     method: "POST",
@@ -88,11 +139,19 @@ async function signIn(email, password) {
   return res.json();
 }
 
+/* ---------- utilità date ---------- */
+
 function monthRange(ym) {
   const [y, m] = ym.split("-").map(Number);
-  const start = `${ym}-01`;
   const nm = m === 12 ? `${y+1}-01` : `${y}-${String(m+1).padStart(2,"0")}`;
-  return { start, endExcl: `${nm}-01` };
+  return { start: `${ym}-01`, endExcl: `${nm}-01` };
+}
+
+// Anno scolastico: 1 settembre → 31 agosto
+function schoolYearRange(dateStr) {
+  const [y, m] = dateStr.split("-").map(Number);
+  const sy = m >= 9 ? y : y - 1;
+  return { start: `${sy}-09-01`, endExcl: `${sy+1}-09-01`, label: `${sy}/${sy+1}` };
 }
 
 function useIsMobile() {
@@ -105,7 +164,9 @@ function useIsMobile() {
   return m;
 }
 
-function Login({ onLogin }) {
+/* ---------- schermata di accesso ---------- */
+
+function Login({ onLogin, notice }) {
   const [ruolo, setRuolo] = useState("docente");
   const [pw, setPw] = useState("");
   const [err, setErr] = useState(null);
@@ -114,9 +175,8 @@ function Login({ onLogin }) {
   const entra = async () => {
     setErr(null); setBusy(true);
     try {
-      const r = RUOLI[ruolo];
-      const data = await signIn(r.email, pw);
-      onLogin({ ruolo, token: data.access_token, refresh: data.refresh_token });
+      const data = await signIn(RUOLI[ruolo].email, pw);
+      onLogin(data, ruolo);
     } catch (e) {
       setErr("Password non corretta. Riprova.");
     } finally { setBusy(false); }
@@ -132,6 +192,12 @@ function Login({ onLogin }) {
       </div>
       <div style={{fontSize:20,fontWeight:500,marginBottom:6,textAlign:"center"}}>Registro presenze</div>
       <div style={{fontSize:13,color:"var(--color-text-secondary)",marginBottom:24,textAlign:"center"}}>Accedi per continuare</div>
+
+      {notice && (
+        <div style={{fontSize:13,padding:"9px 12px",marginBottom:16,borderRadius:"var(--border-radius-md)",background:"var(--color-background-secondary)",border:"0.5px solid var(--color-border-secondary)",color:"var(--color-text-secondary)"}}>
+          {notice}
+        </div>
+      )}
 
       <div style={{fontSize:12,color:"var(--color-text-tertiary)",textTransform:"uppercase",letterSpacing:"0.05em",marginBottom:8}}>Ruolo</div>
       <div style={{display:"flex",gap:8,marginBottom:18}}>
@@ -156,14 +222,25 @@ function Login({ onLogin }) {
 }
 
 function App() {
-  const [auth, setAuth] = useState(null);
-  if (!auth) return <Login onLogin={setAuth} />;
-  return <Registro auth={auth} onLogout={()=>setAuth(null)} />;
+  const [ruolo, setRuolo] = useState(null);
+  const [notice, setNotice] = useState(null);
+
+  useEffect(() => {
+    onSessionLost = () => { setRuolo(null); setNotice("La sessione è scaduta per inattività prolungata. Accedi di nuovo."); };
+    return () => { onSessionLost = null; };
+  }, []);
+
+  const handleLogin = (data, r) => { setSession(data); setNotice(null); setRuolo(r); };
+  const handleLogout = () => { clearSession(); setNotice(null); setRuolo(null); };
+
+  if (!ruolo) return <Login onLogin={handleLogin} notice={notice} />;
+  return <Registro ruolo={ruolo} onLogout={handleLogout} />;
 }
 
-function Registro({ auth, onLogout }) {
-  const isSegreteria = auth.ruolo === "segreteria";
-  const tok = auth.token;
+/* ---------- app principale ---------- */
+
+function Registro({ ruolo, onLogout }) {
+  const isSegreteria = ruolo === "segreteria";
   const isMobile = useIsMobile();
   const [classes, setClasses] = useState([]);
   const [students, setStudents] = useState([]);
@@ -174,86 +251,121 @@ function Registro({ auth, onLogout }) {
   const [view, setView] = useState("reg");
   const [loading, setLoading] = useState(true);
   const [err, setErr] = useState(null);
+  const [notice, setNotice] = useState(null);
   const [newCls, setNewCls] = useState("");
   const [newStu, setNewStu] = useState("");
   const [addExist, setAddExist] = useState("");
   const [editCls, setEditCls] = useState(null);
   const [editStu, setEditStu] = useState(null);
+  const noticeTimer = useRef(null);
+
+  const say = useCallback((m) => {
+    setNotice(m);
+    if (noticeTimer.current) clearTimeout(noticeTimer.current);
+    noticeTimer.current = setTimeout(()=>setNotice(null), 5000);
+  }, []);
+
+  // Distingue il divieto sui dati giustificati da un errore vero
+  const handleErr = useCallback((e, ctx) => {
+    const m = String(e && e.message || "");
+    if (m.startsWith("403")) {
+      say("Questa registrazione è stata giustificata dalla segreteria: solo la segreteria può modificarla.");
+    } else {
+      setErr((ctx ? ctx + ": " : "") + m);
+    }
+  }, [say]);
+
+  const cls = classes.find(c => c.id === selCls);
+  const clsStudentIds = iscrizioni.filter(i => i.classe_id === selCls).map(i => i.studente_id);
+  const idsKey = clsStudentIds.join(",");
+  const clsStudents = students.filter(s => clsStudentIds.includes(s.id));
+  const otherStudents = students.filter(s => !clsStudentIds.includes(s.id));
+  const classNamesOf = (sid) => iscrizioni.filter(i=>i.studente_id===sid).map(i => classes.find(c=>c.id===i.classe_id)?.nome).filter(Boolean);
 
   const loadAll = useCallback(async () => {
     try {
-      setErr(null);
-      const [cls, stu, isc] = await Promise.all([
-        sb("classi?select=*&order=nome", {}, tok),
-        sb("studenti?select=*&order=nome", {}, tok),
-        sb("iscrizioni?select=*", {}, tok),
+      const [c, s, i] = await Promise.all([
+        api("classi?select=*&order=nome"),
+        api("studenti?select=*&order=nome"),
+        api("iscrizioni?select=*"),
       ]);
-      setClasses(cls || []);
-      setStudents(stu || []);
-      setIscrizioni(isc || []);
-      setSelCls(prev => prev || (cls && cls.length ? cls[0].id : null));
+      setClasses(c || []); setStudents(s || []); setIscrizioni(i || []);
+      setSelCls(prev => prev || (c && c.length ? c[0].id : null));
+      setErr(null);
     } catch (e) {
-      setErr("Errore di connessione al database: " + e.message);
-    } finally {
-      setLoading(false);
-    }
-  }, [tok]);
+      setErr("Errore di connessione al database: " + (e.message||""));
+    } finally { setLoading(false); }
+  }, []);
 
+  // Scarica SOLO le presenze della classe selezionata e solo le colonne necessarie
   const loadPresenze = useCallback(async () => {
+    if (!idsKey) { setPresenze([]); return; }
     try {
-      const p = await sb(`presenze?select=*&data=eq.${date}`, {}, tok);
+      const p = await api(`presenze?select=${PRES_COLS}&data=eq.${date}&studente_id=in.(${idsKey})`);
       setPresenze(p || []);
+      setErr(null);
     } catch (e) {
-      setErr("Errore nel caricare le presenze: " + e.message);
+      setErr("Errore nel caricare le presenze: " + (e.message||""));
     }
-  }, [date, tok]);
+  }, [date, idsKey]);
 
   useEffect(() => { loadAll(); }, [loadAll]);
   useEffect(() => { loadPresenze(); }, [loadPresenze]);
 
+  // Aggiornamento automatico solo nella vista Registro e solo a schermo visibile
   useEffect(() => {
+    if (view !== "reg") return;
     const refresh = () => { if (!document.hidden) loadPresenze(); };
     const onVis = () => { if (!document.hidden) { loadPresenze(); loadAll(); } };
     window.addEventListener("focus", refresh);
     document.addEventListener("visibilitychange", onVis);
-    const t = setInterval(refresh, 10000);
+    const t = setInterval(refresh, 25000);
     return () => {
       window.removeEventListener("focus", refresh);
       document.removeEventListener("visibilitychange", onVis);
       clearInterval(t);
     };
-  }, [loadPresenze, loadAll]);
-
-  const cls = classes.find(c => c.id === selCls);
-  const clsStudentIds = iscrizioni.filter(i => i.classe_id === selCls).map(i => i.studente_id);
-  const clsStudents = students.filter(s => clsStudentIds.includes(s.id));
-  const otherStudents = students.filter(s => !clsStudentIds.includes(s.id));
-  const classNamesOf = (sid) => iscrizioni.filter(i=>i.studente_id===sid).map(i => classes.find(c=>c.id===i.classe_id)?.nome).filter(Boolean);
+  }, [view, loadPresenze, loadAll]);
 
   const presKey = (sid, h) => presenze.find(p => p.studente_id === sid && p.fascia === h);
   const stateOf = (sid, h) => presKey(sid, h)?.stato || null;
   const giustOf = (sid, h) => presKey(sid, h)?.giustificato || false;
 
   const cycleHour = async (sid, h) => {
-    const cur = stateOf(sid, h);
-    const next = CYCLE[(CYCLE.indexOf(cur) + 1) % CYCLE.length];
     const existing = presKey(sid, h);
+    if (!isSegreteria && existing && existing.giustificato) {
+      say("Ora giustificata dalla segreteria: solo la segreteria può modificarla.");
+      return;
+    }
+    const next = CYCLE[(CYCLE.indexOf(existing?.stato || null) + 1) % CYCLE.length];
     setPresenze(prev => {
       const others = prev.filter(p => !(p.studente_id === sid && p.fascia === h));
-      return next ? [...others, { ...(existing||{}), studente_id: sid, fascia: h, data: date, stato: next, giustificato: false }] : others;
+      return next ? [...others, { ...(existing||{}), studente_id: sid, fascia: h, stato: next, giustificato: false }] : others;
     });
     try {
       if (next === null) {
-        if (existing?.id) await sb(`presenze?id=eq.${existing.id}`, { method: "DELETE" }, tok);
+        if (existing?.id) await api(`presenze?id=eq.${existing.id}`, { method: "DELETE" });
       } else {
-        await sb("presenze?on_conflict=studente_id,data,fascia", {
+        await api("presenze?on_conflict=studente_id,data,fascia", {
           method: "POST",
           headers: { Prefer: "resolution=merge-duplicates" },
           body: JSON.stringify({ studente_id: sid, data: date, fascia: h, stato: next, giustificato: false }),
-        }, tok);
-        loadPresenze();
+        });
       }
-    } catch (e) { setErr("Errore nel salvataggio: " + e.message); loadPresenze(); }
+      loadPresenze();
+    } catch (e) { handleErr(e, "Salvataggio"); loadPresenze(); }
+  };
+
+  const setAll = async (sid, status) => {
+    try {
+      const rows = HOURS.map(h => ({ studente_id: sid, data: date, fascia: h, stato: status, giustificato: false }));
+      await api("presenze?on_conflict=studente_id,data,fascia", {
+        method: "POST",
+        headers: { Prefer: "resolution=merge-duplicates" },
+        body: JSON.stringify(rows),
+      });
+      loadPresenze();
+    } catch (e) { handleErr(e); loadPresenze(); }
   };
 
   const toggleGiust = async (sid, h) => {
@@ -263,104 +375,101 @@ function Registro({ auth, onLogout }) {
     const newVal = !existing.giustificato;
     setPresenze(prev => prev.map(p => (p.studente_id===sid && p.fascia===h) ? { ...p, giustificato:newVal } : p));
     try {
-      await sb("presenze?on_conflict=studente_id,data,fascia", {
+      await api("presenze?on_conflict=studente_id,data,fascia", {
         method: "POST",
         headers: { Prefer: "resolution=merge-duplicates" },
         body: JSON.stringify({ studente_id: sid, data: date, fascia: h, stato: existing.stato, giustificato: newVal }),
-      }, tok);
+      });
       loadPresenze();
-    } catch (e) { setErr("Errore: " + e.message); loadPresenze(); }
-  };
-
-  const setAll = async (sid, status) => {
-    try {
-      const rows = HOURS.map(h => ({ studente_id: sid, data: date, fascia: h, stato: status, giustificato: false }));
-      await sb("presenze?on_conflict=studente_id,data,fascia", {
-        method: "POST",
-        headers: { Prefer: "resolution=merge-duplicates" },
-        body: JSON.stringify(rows),
-      }, tok);
-      loadPresenze();
-    } catch (e) { setErr("Errore: " + e.message); }
+    } catch (e) { handleErr(e); loadPresenze(); }
   };
 
   const giustDay = async (sid) => {
     if (!isSegreteria) return;
     const rows = presenze.filter(p => p.studente_id===sid && (p.stato==='assente' || p.stato==='ritardo'));
-    if (!rows.length) return;
+    if (!rows.length) {
+      say("Nessuna assenza o ritardo registrato per questo studente in questa giornata.");
+      return;
+    }
     const newVal = !rows.every(r => r.giustificato);
     try {
-      await sb("presenze?on_conflict=studente_id,data,fascia", {
+      await api("presenze?on_conflict=studente_id,data,fascia", {
         method: "POST",
         headers: { Prefer: "resolution=merge-duplicates" },
         body: JSON.stringify(rows.map(r => ({ studente_id: sid, data: date, fascia: r.fascia, stato: r.stato, giustificato: newVal }))),
-      }, tok);
+      });
+      say(newVal ? "Giornata giustificata." : "Giustificazione rimossa.");
       loadPresenze();
-    } catch (e) { setErr("Errore: " + e.message); loadPresenze(); }
+    } catch (e) { handleErr(e); loadPresenze(); }
   };
 
   const addCls = async () => {
     const nome = newCls.trim(); if (!nome) return;
     try {
-      const [c] = await sb("classi", { method: "POST", headers: { Prefer: "return=representation" }, body: JSON.stringify({ nome }) }, tok);
+      const [c] = await api("classi", { method: "POST", headers: { Prefer: "return=representation" }, body: JSON.stringify({ nome }) });
       setNewCls(""); await loadAll(); if (c) setSelCls(c.id);
-    } catch (e) { setErr("Errore: " + e.message); }
+    } catch (e) { handleErr(e); }
   };
 
   const addStu = async () => {
     const nome = newStu.trim(); if (!nome || !cls) return;
+    let created = null;
     try {
-      const [s] = await sb("studenti", { method: "POST", headers: { Prefer: "return=representation" }, body: JSON.stringify({ nome }) }, tok);
-      if (s) await sb("iscrizioni", { method: "POST", body: JSON.stringify({ studente_id: s.id, classe_id: cls.id }) }, tok);
+      const [s] = await api("studenti", { method: "POST", headers: { Prefer: "return=representation" }, body: JSON.stringify({ nome }) });
+      created = s;
+      if (s) await api("iscrizioni", { method: "POST", body: JSON.stringify({ studente_id: s.id, classe_id: cls.id }) });
       setNewStu(""); loadAll();
-    } catch (e) { setErr("Errore: " + e.message); }
+    } catch (e) {
+      // evita studenti "orfani" se l'iscrizione fallisce
+      if (created?.id) { try { await api(`studenti?id=eq.${created.id}`, { method: "DELETE" }); } catch(_){} }
+      handleErr(e);
+    }
   };
 
   const enrollExisting = async () => {
     if (!addExist || !cls) return;
     try {
-      await sb("iscrizioni?on_conflict=studente_id,classe_id", { method: "POST", headers: { Prefer: "resolution=merge-duplicates" }, body: JSON.stringify({ studente_id: addExist, classe_id: cls.id }) }, tok);
+      await api("iscrizioni?on_conflict=studente_id,classe_id", { method: "POST", headers: { Prefer: "resolution=merge-duplicates" }, body: JSON.stringify({ studente_id: addExist, classe_id: cls.id }) });
       setAddExist(""); loadAll();
-    } catch (e) { setErr("Errore: " + e.message); }
+    } catch (e) { handleErr(e); }
   };
 
   const remCls = async (id) => {
     try {
       const affected = iscrizioni.filter(x=>x.classe_id===id).map(x=>x.studente_id);
-      await sb(`classi?id=eq.${id}`, { method: "DELETE" }, tok);
+      await api(`classi?id=eq.${id}`, { method: "DELETE" });
       for (const sid of affected) {
         const others = iscrizioni.filter(x=>x.studente_id===sid && x.classe_id!==id);
-        if (others.length===0) { try { await sb(`studenti?id=eq.${sid}`, { method: "DELETE" }, tok); } catch(_){} }
+        if (others.length===0) { try { await api(`studenti?id=eq.${sid}`, { method: "DELETE" }); } catch(_){} }
       }
       if (selCls===id) setSelCls(null);
       loadAll();
-    } catch (e) { setErr("Errore: " + e.message); }
+    } catch (e) { handleErr(e); }
   };
 
   const remStu = async (sid) => {
     try {
       const isc = iscrizioni.find(x=>x.studente_id===sid && x.classe_id===selCls);
-      if (isc) await sb(`iscrizioni?id=eq.${isc.id}`, { method: "DELETE" }, tok);
+      if (isc) await api(`iscrizioni?id=eq.${isc.id}`, { method: "DELETE" });
       const others = iscrizioni.filter(x=>x.studente_id===sid && x.classe_id!==selCls);
-      if (others.length===0) await sb(`studenti?id=eq.${sid}`, { method: "DELETE" }, tok);
+      if (others.length===0) await api(`studenti?id=eq.${sid}`, { method: "DELETE" });
       loadAll();
-    } catch (e) { setErr("Errore: " + e.message); }
+    } catch (e) { handleErr(e); }
   };
 
   const renameCls = async (id, nome) => {
     const n = (nome||"").trim(); if (!n) return;
-    try { await sb(`classi?id=eq.${id}`, { method: "PATCH", body: JSON.stringify({ nome:n }) }, tok); setEditCls(null); loadAll(); }
-    catch (e) { setErr("Errore: " + e.message); }
+    try { await api(`classi?id=eq.${id}`, { method: "PATCH", body: JSON.stringify({ nome:n }) }); setEditCls(null); loadAll(); }
+    catch (e) { handleErr(e); }
   };
 
   const renameStu = async (id, nome) => {
     const n = (nome||"").trim(); if (!n) return;
-    try { await sb(`studenti?id=eq.${id}`, { method: "PATCH", body: JSON.stringify({ nome:n }) }, tok); setEditStu(null); loadAll(); }
-    catch (e) { setErr("Errore: " + e.message); }
+    try { await api(`studenti?id=eq.${id}`, { method: "PATCH", body: JSON.stringify({ nome:n }) }); setEditStu(null); loadAll(); }
+    catch (e) { handleErr(e); }
   };
 
   const b = {fontSize:13,padding:"5px 12px",border:"0.5px solid var(--color-border-secondary)",borderRadius:"var(--border-radius-md)",background:"transparent",cursor:"pointer",color:"var(--color-text-primary)"};
-  const bA = {...b,background:"var(--color-background-secondary)",fontWeight:500,border:"0.5px solid var(--color-border-primary)"};
   const bBlue = {...b,background:"#1F3864",color:"#fff",fontWeight:500,border:"0.5px solid #1F3864"};
   const inp = {fontSize:13,padding:"5px 10px",border:"0.5px solid var(--color-border-secondary)",borderRadius:"var(--border-radius-md)",background:"transparent",color:"var(--color-text-primary)",outline:"none"};
   const th = {fontSize:11,color:"var(--color-text-secondary)",fontWeight:400,textTransform:"uppercase",letterSpacing:"0.04em",padding:"8px 4px",textAlign:"center"};
@@ -516,8 +625,8 @@ function Registro({ auth, onLogout }) {
   const content = (
     <>
       {view==="reg" && registerView()}
-      {view==="stats" && cls && <StatsView cls={cls} clsStudents={clsStudents} date={date} tok={tok} />}
-      {view==="export" && isSegreteria && <ExportView classes={classes} students={students} iscrizioni={iscrizioni} tok={tok} />}
+      {view==="stats" && cls && <StatsView cls={cls} clsStudents={clsStudents} date={date} />}
+      {view==="export" && isSegreteria && <ExportView classes={classes} students={students} iscrizioni={iscrizioni} />}
       {view==="manage" && isSegreteria && (
         <div>
           <div style={{marginBottom:20}}>
@@ -625,9 +734,15 @@ function Registro({ auth, onLogout }) {
         {isSegreteria && <button style={view==="manage"?bBlue:b} onClick={()=>setView("manage")}>Gestione</button>}
       </div>
 
+      {notice && (
+        <div style={{marginBottom:12,padding:"9px 14px",background:"var(--color-background-secondary)",border:"0.5px solid var(--color-border-secondary)",borderRadius:"var(--border-radius-md)",fontSize:13,color:"var(--color-text-secondary)"}}>
+          {notice}
+        </div>
+      )}
+
       {err && (
         <div style={{marginBottom:12,padding:"10px 14px",background:"var(--color-background-danger)",border:"0.5px solid var(--color-border-danger)",borderRadius:"var(--border-radius-md)",fontSize:13,color:"var(--color-text-danger)"}}>
-          {err} <button style={{...b,marginLeft:8,padding:"2px 10px"}} onClick={()=>{setLoading(true);loadAll();loadPresenze();}}>Riprova</button>
+          {err} <button style={{...b,marginLeft:8,padding:"2px 10px"}} onClick={()=>{loadAll();loadPresenze();}}>Riprova</button>
         </div>
       )}
 
@@ -658,21 +773,27 @@ function Registro({ auth, onLogout }) {
   );
 }
 
-function StatsView({ cls, clsStudents, date, tok }) {
+/* ---------- storico ---------- */
+
+function StatsView({ cls, clsStudents, date }) {
   const [stats, setStats] = useState(null);
   const [period, setPeriod] = useState("month");
   const [err, setErr] = useState(null);
+  const idsKey = clsStudents.map(s=>s.id).join(",");
+  const sy = schoolYearRange(date);
 
   useEffect(() => {
+    let annullato = false;
     async function load() {
       try {
         setErr(null); setStats(null);
+        if (!idsKey) { setStats([]); return; }
         let filter = "";
         if (period === "day") filter = `&data=eq.${date}`;
-        else if (period === "month") { const { start, endExcl } = monthRange(date.slice(0,7)); filter = `&data=gte.${start}&data=lt.${endExcl}`; }
-        const ids = clsStudents.map(s=>s.id);
-        if (!ids.length) { setStats([]); return; }
-        const p = await sb(`presenze?select=*&studente_id=in.(${ids.join(",")})${filter}`, {}, tok);
+        else if (period === "month") { const r = monthRange(date.slice(0,7)); filter = `&data=gte.${r.start}&data=lt.${r.endExcl}`; }
+        else { filter = `&data=gte.${sy.start}&data=lt.${sy.endExcl}`; }
+        const p = await api(`presenze?select=studente_id,data,fascia,stato,giustificato&studente_id=in.(${idsKey})${filter}`);
+        if (annullato) return;
         const map = {};
         clsStudents.forEach(s => { map[s.id] = { ...s, presente:0, assente:0, ritardo:0, giustificate:0, giorniAss:0, giorniGiust:0 }; });
         const byDay = {};
@@ -693,16 +814,17 @@ function StatsView({ cls, clsStudents, date, tok }) {
           });
         });
         setStats(Object.values(map));
-      } catch (e) { setErr("Errore: " + e.message); }
+      } catch (e) { if (!annullato) setErr("Errore: " + (e.message||"")); }
     }
     load();
-  }, [period, date, cls.id, tok, clsStudents.length]);
+    return () => { annullato = true; };
+  }, [period, date, idsKey]);
 
   const b = {fontSize:13,padding:"5px 12px",border:"0.5px solid var(--color-border-secondary)",borderRadius:"var(--border-radius-md)",background:"transparent",cursor:"pointer",color:"var(--color-text-primary)"};
   const bBlue = {...b,background:"#1F3864",color:"#fff",fontWeight:500,border:"0.5px solid #1F3864"};
   const th = {fontSize:11,color:"var(--color-text-secondary)",fontWeight:400,textTransform:"uppercase",letterSpacing:"0.04em",padding:"8px 12px"};
 
-  const labels = { day:"Giorno selezionato", month:"Mese corrente", all:"Tutto lo storico" };
+  const labels = { day:"Giorno selezionato", month:"Mese corrente", year:`Anno scolastico ${sy.label}` };
 
   return (
     <React.Fragment>
@@ -744,11 +866,16 @@ function StatsView({ cls, clsStudents, date, tok }) {
           </tbody>
         </table>
       </div>
+      <div style={{fontSize:11,color:"var(--color-text-tertiary)",marginTop:8}}>
+        Un <strong>giorno di assenza</strong> è conteggiato quando lo studente risulta assente in tutte e quattro le fasce del mattino (8:30–12:30).
+      </div>
     </React.Fragment>
   );
 }
 
-function ExportView({ classes, students, iscrizioni, tok }) {
+/* ---------- esportazione ---------- */
+
+function ExportView({ classes, students, iscrizioni }) {
   const [clsId, setClsId] = useState(classes[0]?.id || "");
   const [stuId, setStuId] = useState("");
   const [month, setMonth] = useState(new Date().toISOString().slice(0,7));
@@ -768,8 +895,24 @@ function ExportView({ classes, students, iscrizioni, tok }) {
 
   const fetchRows = async () => {
     const { start, endExcl } = monthRange(month);
-    const p = await sb(`presenze?select=*&studente_id=eq.${stuId}&data=gte.${start}&data=lt.${endExcl}&order=data,fascia`, {}, tok);
+    const p = await api(`presenze?select=data,fascia,stato,giustificato&studente_id=eq.${stuId}&data=gte.${start}&data=lt.${endExcl}&order=data,fascia`);
     return p || [];
+  };
+
+  const totali = (rows) => {
+    let pr=0,as=0,ri=0,gi=0;
+    const byDay = {};
+    rows.forEach(r => {
+      if(r.stato==='presente')pr++; else if(r.stato==='assente')as++; else if(r.stato==='ritardo')ri++;
+      if(r.giustificato && (r.stato==='assente'||r.stato==='ritardo'))gi++;
+      (byDay[r.data] = byDay[r.data] || []).push(r);
+    });
+    let gAss=0, gGiust=0;
+    Object.values(byDay).forEach(rs => {
+      const ma = rs.filter(r => MORNING.includes(r.fascia) && r.stato==='assente');
+      if (ma.length >= 4) { gAss++; if (ma.every(r=>r.giustificato)) gGiust++; }
+    });
+    return { pr, as, ri, gi, gAss, gGiust };
   };
 
   const MESE_LBL = (() => { const [y,m] = month.split("-"); return `${MESI[parseInt(m,10)-1]||""} ${y}`; })();
@@ -810,12 +953,12 @@ ${inner}
     const w = openBlank(); if (!w) return;
     setErr(null); setBusy(true);
     try {
-      const rows = await fetchRows();
-      let pr=0,as=0,ri=0,gi=0;
-      rows.forEach(r => { if(r.stato==='presente')pr++; else if(r.stato==='assente')as++; else if(r.stato==='ritardo')ri++; if(r.giustificato&&(r.stato==='assente'||r.stato==='ritardo'))gi++; });
-      const inner = `<table><tr><th>Ore presenti</th><th>Ore assenti</th><th>Ore ritardo</th><th>di cui giustificate</th></tr><tr><td>${pr}</td><td>${as}</td><td>${ri}</td><td>${gi}</td></tr></table>`;
+      const t = totali(await fetchRows());
+      const inner = `<table>
+<tr><th>Ore presenti</th><th>Ore assenti</th><th>Ore ritardo</th><th>Ore giustificate</th><th>Giorni assenza</th><th>Giorni giustificati</th></tr>
+<tr><td>${t.pr}</td><td>${t.as}</td><td>${t.ri}</td><td>${t.gi}</td><td>${t.gAss}</td><td>${t.gGiust}</td></tr></table>`;
       w.document.open(); w.document.write(reportHtml("Riepilogo mensile", inner)); w.document.close();
-    } catch(e){ setErr("Errore: "+e.message); try{w.close();}catch(_){} } finally { setBusy(false); }
+    } catch(e){ setErr("Errore: "+(e.message||"")); try{w.close();}catch(_){} } finally { setBusy(false); }
   };
 
   const pdfDettaglio = async () => {
@@ -829,33 +972,30 @@ ${inner}
         : `<tr><td colspan="4" style="text-align:center;color:#888">Nessun dato registrato nel mese</td></tr>`;
       const inner = `<table><tr><th>Data</th><th>Fascia</th><th>Stato</th><th>Giustificato</th></tr>${body}</table>`;
       w.document.open(); w.document.write(reportHtml("Dettaglio mensile", inner)); w.document.close();
-    } catch(e){ setErr("Errore: "+e.message); try{w.close();}catch(_){} } finally { setBusy(false); }
+    } catch(e){ setErr("Errore: "+(e.message||"")); try{w.close();}catch(_){} } finally { setBusy(false); }
   };
 
   const doRiepilogo = async () => {
     if (!stuId) return;
     setErr(null); setBusy(true);
     try {
-      const rows = await fetchRows();
-      let pr=0,as=0,ri=0,gi=0;
-      rows.forEach(r => {
-        if(r.stato==='presente')pr++; else if(r.stato==='assente')as++; else if(r.stato==='ritardo')ri++;
-        if(r.giustificato && (r.stato==='assente'||r.stato==='ritardo'))gi++;
-      });
+      const t = totali(await fetchRows());
       const data = [{
         Studente: studentObj?.nome || "",
         Classe: clsObj?.nome || "",
         Mese: month,
-        "Ore presenti": pr,
-        "Ore assenti": as,
-        "Ore ritardo": ri,
-        "di cui giustificate": gi,
+        "Ore presenti": t.pr,
+        "Ore assenti": t.as,
+        "Ore ritardo": t.ri,
+        "Ore giustificate": t.gi,
+        "Giorni assenza": t.gAss,
+        "Giorni giustificati": t.gGiust,
       }];
       const ws = XLSX.utils.json_to_sheet(data);
       const wb = XLSX.utils.book_new();
       XLSX.utils.book_append_sheet(wb, ws, "Riepilogo");
       XLSX.writeFile(wb, `riepilogo_${safeName}_${month}.xlsx`);
-    } catch(e){ setErr("Errore: "+e.message); } finally { setBusy(false); }
+    } catch(e){ setErr("Errore: "+(e.message||"")); } finally { setBusy(false); }
   };
 
   const doDettaglio = async () => {
@@ -864,7 +1004,7 @@ ${inner}
     try {
       const rows = await fetchRows();
       const data = rows.map(r => ({
-        Data: r.data,
+        Data: r.data.split("-").reverse().join("/"),
         Fascia: `${r.fascia}–${HOUR_END[r.fascia]||""}`,
         Stato: r.stato,
         Giustificato: r.giustificato ? "Sì" : "No",
@@ -874,7 +1014,7 @@ ${inner}
       const wb = XLSX.utils.book_new();
       XLSX.utils.book_append_sheet(wb, ws, "Dettaglio");
       XLSX.writeFile(wb, `dettaglio_${safeName}_${month}.xlsx`);
-    } catch(e){ setErr("Errore: "+e.message); } finally { setBusy(false); }
+    } catch(e){ setErr("Errore: "+(e.message||"")); } finally { setBusy(false); }
   };
 
   const lbl = {fontSize:12,color:"var(--color-text-tertiary)",textTransform:"uppercase",letterSpacing:"0.05em",marginBottom:6};
@@ -922,7 +1062,7 @@ ${inner}
       </div>
 
       <div style={{fontSize:11,color:"var(--color-text-tertiary)",marginTop:14}}>
-        Il <strong>riepilogo</strong> contiene i totali del mese; il <strong>dettaglio</strong> elenca ogni singola fascia oraria registrata.
+        Il <strong>riepilogo</strong> contiene i totali del mese, giorni di assenza compresi; il <strong>dettaglio</strong> elenca ogni singola fascia oraria registrata.
       </div>
     </div>
   );
