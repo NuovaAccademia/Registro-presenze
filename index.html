@@ -58,6 +58,9 @@ const MAX_POM = 3;
 const GIORNI_INDIETRO = 0;
 // Quante ore già concluse un docente può ancora modificare (0 = solo l'ora in corso)
 const ORE_INDIETRO = 0;
+// Quante ore successive a quella in corso un docente può già compilare
+// (9 = tutte quelle che restano nella giornata; 1 = soltanto l'ora immediatamente seguente)
+const ORE_AVANTI = 9;
 const GIORNI = ["Lun","Mar","Mer","Gio","Ven","Sab"];
 const MESI = ["gennaio","febbraio","marzo","aprile","maggio","giugno","luglio","agosto","settembre","ottobre","novembre","dicembre"];
 const CYCLE = [null,'presente','assente','ritardo'];
@@ -421,7 +424,7 @@ function Registro({ ruolo, onLogout }) {
     return rec ? (rec.pom || 0) : 0;
   };
 
-  // Blocco orario: i docenti segnano solo il giorno corrente e solo le ore già iniziate
+  // Blocco orario: i docenti segnano solo il giorno corrente e solo le ore non ancora concluse
   const oggiISO = new Date().toISOString().split("T")[0];
   const giorniDaOggi = Math.round((new Date(date+"T00:00:00Z") - new Date(oggiISO+"T00:00:00Z")) / 86400000);
   const motivoBlocco = (h) => {
@@ -433,8 +436,8 @@ function Registro({ ruolo, onLogout }) {
     const n = new Date();
     const adesso = n.getHours()*60 + n.getMinutes();
     const inizio = hh*60 + mm;
-    if (adesso < inizio) return "Questa fascia oraria non è ancora iniziata.";
     if (adesso >= inizio + 60 + ORE_INDIETRO*60) return "Questa fascia oraria è già conclusa: per le correzioni rivolgiti alla segreteria.";
+    if (inizio > adesso + ORE_AVANTI*60) return "Questa fascia oraria è ancora troppo lontana: potrai compilarla più avanti nella giornata.";
     return null;
   };
 
@@ -632,7 +635,7 @@ function Registro({ ruolo, onLogout }) {
                   {f.p>0 && <span style={{fontSize:11,fontWeight:400,color:"var(--color-text-tertiary)",marginLeft:6}}>· {f.m}+{f.p}</span>}
                   {f.fasce.length===0 && <span style={{fontSize:11,fontWeight:400,color:"var(--color-text-tertiary)",marginLeft:6}}>· nessuna lezione</span>}
                 </span>
-                {CYCLE.filter(Boolean).map(st=>(
+                {isSegreteria && CYCLE.filter(Boolean).map(st=>(
                   <button key={st} onClick={()=>setAll(s.id,st)} title={`Tutta la giornata: ${st}`}
                     style={{width:30,height:30,borderRadius:6,cursor:"pointer",border:`1px solid ${ST[st].fg}55`,background:ST[st].bg,color:ST[st].fg,fontSize:13,fontWeight:600}}>{ST[st].l}</button>
                 ))}
@@ -687,13 +690,13 @@ function Registro({ ruolo, onLogout }) {
           <table style={{width:"100%",borderCollapse:"collapse",tableLayout:"fixed"}}>
             <colgroup>
               <col style={{width:116}} />
-              <col style={{width:100}} />
+              {isSegreteria && <col style={{width:100}} />}
               {HOURS.map(h=><col key={h} style={{width:40}} />)}
             </colgroup>
             <thead>
               <tr style={{background:"var(--color-background-secondary)",borderBottom:"0.5px solid var(--color-border-tertiary)"}}>
                 <th style={{...th,textAlign:"left",padding:"8px 12px"}}>Studente</th>
-                <th style={th}>Tutta la giornata</th>
+                {isSegreteria && <th style={th}>Tutta la giornata</th>}
                 {HOURS.map(h=>(
                   <th key={h} style={{...th,padding:"8px 2px"}}>
                     <div>{h}</div>
@@ -703,7 +706,7 @@ function Registro({ ruolo, onLogout }) {
               </tr>
             </thead>
             <tbody>
-              {clsStudents.length===0 && <tr><td colSpan={HOURS.length+2} style={{padding:"20px 14px",fontSize:13,color:"var(--color-text-tertiary)"}}>Nessuno studente.{isSegreteria?" Aggiungili dalla sezione Gestione.":""}</td></tr>}
+              {clsStudents.length===0 && <tr><td colSpan={HOURS.length+(isSegreteria?2:1)} style={{padding:"20px 14px",fontSize:13,color:"var(--color-text-tertiary)"}}>Nessuno studente.{isSegreteria?" Aggiungili dalla sezione Gestione.":""}</td></tr>}
               {clsStudents.map((s,i)=>{
                 const f = fasceOggi(s.id);
                 return (
@@ -711,6 +714,7 @@ function Registro({ ruolo, onLogout }) {
                   <td style={{padding:"6px 12px",fontSize:13,opacity:f.fasce.length===0?0.55:1}}>{s.nome}
                     {classNamesOf(s.id).length>1 && <span title="Iscritto a più classi" style={{fontSize:10,color:"var(--color-text-tertiary)",marginLeft:5}}>●</span>}
                   </td>
+                  {isSegreteria && (
                   <td style={{textAlign:"center",padding:"4px 2px"}}>
                     <div style={{display:"flex",justifyContent:"center",gap:3}}>
                       {CYCLE.filter(Boolean).map(st=>(
@@ -723,6 +727,7 @@ function Registro({ ruolo, onLogout }) {
                       )}
                     </div>
                   </td>
+                  )}
                   {HOURS.map(h=>{
                     const isPausa = f.pausa === h;
                     const previsto = f.fasce.includes(h);
