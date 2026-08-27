@@ -56,13 +56,15 @@ const HOUR_END = {'08:30':'09:30','09:30':'10:30','10:30':'11:30','11:30':'12:30
 const MAX_POM = 3;
 // Quanti giorni passati un docente può ancora modificare (0 = solo oggi)
 const GIORNI_INDIETRO = 0;
+// Quante ore già concluse un docente può ancora modificare (0 = solo l'ora in corso)
+const ORE_INDIETRO = 0;
 const GIORNI = ["Lun","Mar","Mer","Gio","Ven","Sab"];
 const MESI = ["gennaio","febbraio","marzo","aprile","maggio","giugno","luglio","agosto","settembre","ottobre","novembre","dicembre"];
 const CYCLE = [null,'presente','assente','ritardo'];
 const ST = {
-  presente: { bg:'#EAF3DE', fg:'#3B6D11', l:'P' },
-  assente:  { bg:'#FCEBEB', fg:'#A32D2D', l:'A' },
-  ritardo:  { bg:'#FAEEDA', fg:'#854F0B', l:'R' },
+  presente: { bg:'#EAF3DE', fg:'#3B6D11', fbg:'#F4F9EE', ffg:'#8AAE6B', l:'P' },
+  assente:  { bg:'#FCEBEB', fg:'#A32D2D', fbg:'#FDF5F5', ffg:'#CE8B8B', l:'A' },
+  ritardo:  { bg:'#FAEEDA', fg:'#854F0B', fbg:'#FCF7EE', ffg:'#C2A272', l:'R' },
 };
 const PRES_COLS = "id,studente_id,fascia,stato,giustificato";
 const IDLE_MS = 15 * 60 * 1000;   // oltre questo tempo di inattività il refresh si sospende
@@ -422,16 +424,17 @@ function Registro({ ruolo, onLogout }) {
   // Blocco orario: i docenti segnano solo il giorno corrente e solo le ore già iniziate
   const oggiISO = new Date().toISOString().split("T")[0];
   const giorniDaOggi = Math.round((new Date(date+"T00:00:00Z") - new Date(oggiISO+"T00:00:00Z")) / 86400000);
-  const oraIniziata = (h) => {
-    const [hh,mm] = h.split(":").map(Number);
-    const n = new Date();
-    return n.getHours()*60 + n.getMinutes() >= hh*60 + mm;
-  };
   const motivoBlocco = (h) => {
     if (isSegreteria) return null;
     if (giorniDaOggi > 0) return "Non è possibile segnare presenze per una data futura.";
     if (giorniDaOggi < -GIORNI_INDIETRO) return "I giorni già trascorsi possono essere corretti solo dalla segreteria.";
-    if (h && !oraIniziata(h)) return "Questa fascia oraria non è ancora iniziata.";
+    if (!h) return null;
+    const [hh,mm] = h.split(":").map(Number);
+    const n = new Date();
+    const adesso = n.getHours()*60 + n.getMinutes();
+    const inizio = hh*60 + mm;
+    if (adesso < inizio) return "Questa fascia oraria non è ancora iniziata.";
+    if (adesso >= inizio + 60 + ORE_INDIETRO*60) return "Questa fascia oraria è già conclusa: per le correzioni rivolgiti alla segreteria.";
     return null;
   };
 
@@ -654,10 +657,11 @@ function Registro({ ruolo, onLogout }) {
                     <div key={h} style={{position:"relative"}}>
                       <button onClick={()=>cycleHour(s.id,h)} disabled={locked}
                         title={locked?motivoBlocco(h):""}
-                        style={{width:"100%",height:58,borderRadius:"var(--border-radius-md)",cursor:locked?"default":"pointer",display:"flex",flexDirection:"column",alignItems:"center",justifyContent:"center",gap:1,opacity:locked?0.5:1,
-                          border:info?`1px solid ${info.fg}55`:(locked?"0.5px dashed var(--color-border-secondary)":"0.5px solid var(--color-border-tertiary)"),
-                          background:info?info.bg:"var(--color-background-secondary)",
-                          color:info?info.fg:"var(--color-text-tertiary)"}}>
+                        style={{width:"100%",height:58,borderRadius:"var(--border-radius-md)",cursor:locked?"default":"pointer",display:"flex",flexDirection:"column",alignItems:"center",justifyContent:"center",gap:1,
+                          opacity:(locked&&!info)?0.5:1,
+                          border:info?`1px solid ${locked?info.ffg:info.fg}55`:(locked?"0.5px dashed var(--color-border-secondary)":"0.5px solid var(--color-border-tertiary)"),
+                          background:info?(locked?info.fbg:info.bg):"var(--color-background-secondary)",
+                          color:info?(locked?info.ffg:info.fg):"var(--color-text-tertiary)"}}>
                         <span style={{fontSize:11,opacity:0.8}}>{h}<span style={{opacity:0.6}}>→{HOUR_END[h]}</span></span>
                         <span style={{fontSize:20,fontWeight:600}}>{info?info.l:"·"}</span>
                       </button>
@@ -671,7 +675,7 @@ function Registro({ ruolo, onLogout }) {
           })}
           <div style={{fontSize:11,color:"var(--color-text-tertiary)",marginTop:4,paddingLeft:2}}>
             Le fasce con il trattino non sono previste dall'orario dello studente. La pallina <strong>G</strong> indica le giustificazioni{isSegreteria?" — toccala per giustificare.":"."}
-            {!isSegreteria && <span> Le celle tratteggiate non sono modificabili: puoi segnare solo le ore già iniziate della giornata di oggi.</span>}
+            {!isSegreteria && <span> Le celle tratteggiate o sbiadite non sono modificabili: puoi segnare solo l'ora attualmente in corso.</span>}
           </div>
         </div>
       );
@@ -735,9 +739,11 @@ function Registro({ ruolo, onLogout }) {
                         <div style={{position:"relative",display:"inline-block"}}>
                           <button onClick={()=>cycleHour(s.id,h)} disabled={!previsto||locked}
                             title={!previsto?"Non previsto dall'orario":(locked?motivoBlocco(h):(info?`${state} — clicca per cambiare`:"Clicca per segnare"))}
-                            style={{width:36,height:30,borderRadius:"var(--border-radius-md)",cursor:(previsto&&!locked)?"pointer":"default",opacity:!previsto?0.3:(locked?0.5:1),
-                              border:info?`1px solid ${info.fg}44`:(locked?"0.5px dashed var(--color-border-secondary)":"0.5px solid var(--color-border-tertiary)"),
-                              background:info?info.bg:"transparent",color:info?info.fg:"var(--color-text-tertiary)",fontSize:13,fontWeight:info?500:400}}>
+                            style={{width:36,height:30,borderRadius:"var(--border-radius-md)",cursor:(previsto&&!locked)?"pointer":"default",
+                              opacity:!previsto?0.3:((locked&&!info)?0.5:1),
+                              border:info?`1px solid ${locked?info.ffg:info.fg}44`:(locked?"0.5px dashed var(--color-border-secondary)":"0.5px solid var(--color-border-tertiary)"),
+                              background:info?(locked?info.fbg:info.bg):"transparent",
+                              color:info?(locked?info.ffg:info.fg):"var(--color-text-tertiary)",fontSize:13,fontWeight:info?500:400}}>
                             {previsto?(info?info.l:"·"):"–"}
                           </button>
                           {previsto && giustBadge(s.id,h,state,giustOf(s.id,h),15)}
@@ -753,7 +759,7 @@ function Registro({ ruolo, onLogout }) {
         </div>
         <div style={{fontSize:11,color:"var(--color-text-tertiary)",marginTop:8,paddingLeft:2}}>
           Le fasce con il trattino <strong>–</strong> non sono previste dall'orario dello studente; <strong>pausa</strong> indica l'ora di stacco fra mattina e pomeriggio. La pallina <strong>G</strong> segnala le giustificazioni{isSegreteria?" — cliccala per giustificare.":" (solo la segreteria può modificarle)."} Il pallino <strong>●</strong> indica chi è iscritto a più classi.
-          {!isSegreteria && <span> Le celle tratteggiate non sono modificabili: puoi segnare solo le ore già iniziate della giornata di oggi.</span>}
+                      {!isSegreteria && <span> Le celle tratteggiate o sbiadite non sono modificabili: puoi segnare solo l'ora attualmente in corso.</span>}
         </div>
       </div>
     );
@@ -953,7 +959,7 @@ function Registro({ ruolo, onLogout }) {
 
 function StatsView({ cls, clsStudents, date, orari }) {
   const [stats, setStats] = useState(null);
-  const [period, setPeriod] = useState("month");
+  const [period, setPeriod] = useState("day");
   const [err, setErr] = useState(null);
   const idsKey = clsStudents.map(s=>s.id).join(",");
   const sy = schoolYearRange(date);
