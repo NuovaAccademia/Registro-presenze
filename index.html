@@ -51,8 +51,9 @@ const RUOLI = {
   segreteria: { email: "segreteria@registro.app", label: "Segreteria" },
 };
 
-const HOURS = ['08:30','09:30','10:30','11:30','12:30','13:30'];
-const HOUR_END = {'08:30':'09:30','09:30':'10:30','10:30':'11:30','11:30':'12:30','12:30':'13:30','13:30':'14:30'};
+const HOURS = ['08:30','09:30','10:30','11:30','12:30','13:30','14:30','15:30','16:30'];
+const HOUR_END = {'08:30':'09:30','09:30':'10:30','10:30':'11:30','11:30':'12:30','12:30':'13:30','13:30':'14:30','14:30':'15:30','15:30':'16:30','16:30':'17:30'};
+const MAX_POM = 3;
 const GIORNI = ["Lun","Mar","Mer","Gio","Ven","Sab"];
 const MESI = ["gennaio","febbraio","marzo","aprile","maggio","giugno","luglio","agosto","settembre","ottobre","novembre","dicembre"];
 const CYCLE = [null,'presente','assente','ritardo'];
@@ -175,13 +176,27 @@ function nomeGiorno(dateStr) {
 }
 function itDate(d) { return d.split("-").reverse().join("/"); }
 
-// Ore previste da orario: se non impostato, 6 da lunedì a venerdì e 0 il sabato
-function oreProviste(orari, sid, dateStr) {
+// Fasce previste da orario: mattina, un'ora di pausa, poi eventuale pomeriggio.
+// Se non impostato: 6 ore da lunedì a venerdì, sabato libero, nessun pomeriggio.
+function fasceGiorno(orari, sid, dateStr) {
   const w = weekdayOf(dateStr);
-  if (w === 0) return 0;
+  if (w === 0) return { mattina: [], pausa: null, pomeriggio: [], fasce: [], m: 0, p: 0 };
   const rec = orari.find(o => o.studente_id === sid && o.giorno === w);
-  if (rec) return rec.ore;
-  return w === 6 ? 0 : 6;
+  const m = rec ? rec.ore : (w === 6 ? 0 : 6);
+  const p = rec ? (rec.pom || 0) : 0;
+  const mattina = HOURS.slice(0, m);
+  let pausa = null, pomeriggio = [];
+  if (m > 0 && p > 0) {
+    pausa = HOURS[m] || null;
+    pomeriggio = HOURS.slice(m + 1, m + 1 + p);
+  }
+  return { mattina, pausa, pomeriggio, fasce: [...mattina, ...pomeriggio], m, p };
+}
+
+// Quante ore pomeridiane stanno ancora nella giornata (ultima fascia entro le 17:30)
+function maxPom(m) {
+  if (m <= 0) return 0;
+  return Math.max(0, Math.min(MAX_POM, HOURS.length - m - 1));
 }
 
 // Calcola giorni di assenza e ore, rispettando l'orario di ciascuno
@@ -196,8 +211,8 @@ function analizza(rows, orari, sid) {
     if (r.giustificato && (r.stato==='assente' || r.stato==='ritardo')) gi++;
   });
   Object.keys(byDay).sort().forEach(d => {
-    const ore = oreProviste(orari, sid, d);
-    const fasce = HOURS.slice(0, ore);
+    const { fasce } = fasceGiorno(orari, sid, d);
+    const ore = fasce.length;
     const rs = byDay[d];
     const assenti = rs.filter(r => fasce.includes(r.fascia) && r.stato === 'assente');
     const interoGiorno = ore > 0 && assenti.length === ore;
@@ -385,11 +400,23 @@ function Registro({ ruolo, onLogout }) {
   const presKey = (sid, h) => presenze.find(p => p.studente_id === sid && p.fascia === h);
   const stateOf = (sid, h) => presKey(sid, h)?.stato || null;
   const giustOf = (sid, h) => presKey(sid, h)?.giustificato || false;
-  const oreOggi = (sid) => oreProviste(orari, sid, date);
+  const fasceOggi = (sid) => fasceGiorno(orari, sid, date);
   const oreOf = (sid, giorno) => {
     const rec = orari.find(o => o.studente_id === sid && o.giorno === giorno);
     return rec ? rec.ore : (giorno === 6 ? 0 : 6);
   };
+  const pomOf = (sid, giorno) => {
+    const rec = orari.find(o => o.studente_id === sid && o.giorno === giorno);
+    return rec ? (rec.pom || 0) : 0;
+  };
+
+  // Colonne da mostrare: sempre almeno le 6 del mattino, di più se qualcuno ha il pomeriggio
+  const lastIdx = clsStudents.reduce((mx, s) => {
+    const f = fasceOggi(s.id);
+    return Math.max(mx, f.p > 0 ? f.m + f.p : f.m - 1);
+  }, 5);
+  const visibleHours = HOURS.slice(0, Math.max(6, lastIdx + 1));
+  const wide = visibleHours.length > 6;
 
   const mergeLocal = (rows) => setPresenze(prev => {
     const map = new Map(prev.map(p => [p.studente_id + "|" + p.fascia, p]));
@@ -398,7 +425,7 @@ function Registro({ ruolo, onLogout }) {
   });
 
   const cycleHour = async (sid, h) => {
-    if (!HOURS.slice(0, oreOggi(sid)).includes(h)) {
+    if (!fasceOggi(sid).fasce.includes(h)) {
       say("Questa fascia non è prevista dall'orario dello studente.");
       return;
     }
@@ -423,7 +450,7 @@ function Registro({ ruolo, onLogout }) {
   };
 
   const setAll = async (sid, status) => {
-    const fasce = HOURS.slice(0, oreOggi(sid));
+    const fasce = fasceOggi(sid).fasce;
     if (!fasce.length) { say("Nessuna ora prevista dall'orario per questo giorno."); return; }
     try {
       const saved = await api("presenze?on_conflict=studente_id,data,fascia", {
@@ -462,15 +489,16 @@ function Registro({ ruolo, onLogout }) {
     } catch (e) { handleErr(e); loadPresenze(); }
   };
 
-  const setOrario = async (sid, giorno, ore) => {
+  const setOrario = async (sid, giorno, ore, pom) => {
+    const p = Math.min(pom, maxPom(ore));
     setOrari(prev => {
       const others = prev.filter(o => !(o.studente_id===sid && o.giorno===giorno));
-      return [...others, { studente_id: sid, giorno, ore }];
+      return [...others, { studente_id: sid, giorno, ore, pom: p }];
     });
     try {
       await api("orari?on_conflict=studente_id,giorno", {
         method: "POST", headers: WRITE,
-        body: JSON.stringify({ studente_id: sid, giorno, ore }),
+        body: JSON.stringify({ studente_id: sid, giorno, ore, pom: p }),
       });
     } catch (e) { handleErr(e); loadAll(); }
   };
@@ -568,13 +596,15 @@ function Registro({ ruolo, onLogout }) {
         <div>
           {clsStudents.length===0 && <div style={{padding:"16px 4px",fontSize:14,color:"var(--color-text-tertiary)"}}>Nessuno studente.{isSegreteria?" Aggiungili dalla sezione Gestione.":""}</div>}
           {clsStudents.map(s=>{
-            const ore = oreOggi(s.id);
+            const f = fasceOggi(s.id);
+            const celle = [...f.mattina, ...(f.pausa?[f.pausa]:[]), ...f.pomeriggio];
             return (
             <div key={s.id} style={{background:"var(--color-background-primary)",border:"0.5px solid var(--color-border-tertiary)",borderRadius:"var(--border-radius-lg)",padding:"12px 12px 14px",marginBottom:10}}>
               <div style={{display:"flex",alignItems:"center",gap:8,marginBottom:10}}>
                 <span style={{flex:1,fontSize:15,fontWeight:500}}>{s.nome}
                   {classNamesOf(s.id).length>1 && <span style={{fontSize:11,fontWeight:400,color:"var(--color-text-tertiary)",marginLeft:6}}>· più classi</span>}
-                  {ore===0 && <span style={{fontSize:11,fontWeight:400,color:"var(--color-text-tertiary)",marginLeft:6}}>· nessuna lezione</span>}
+                  {f.p>0 && <span style={{fontSize:11,fontWeight:400,color:"var(--color-text-tertiary)",marginLeft:6}}>· {f.m}+{f.p}</span>}
+                  {f.fasce.length===0 && <span style={{fontSize:11,fontWeight:400,color:"var(--color-text-tertiary)",marginLeft:6}}>· nessuna lezione</span>}
                 </span>
                 {CYCLE.filter(Boolean).map(st=>(
                   <button key={st} onClick={()=>setAll(s.id,st)} title={`Tutta la giornata: ${st}`}
@@ -586,22 +616,27 @@ function Registro({ ruolo, onLogout }) {
                 )}
               </div>
               <div style={{display:"grid",gridTemplateColumns:"repeat(3,1fr)",gap:8}}>
-                {HOURS.map((h,idx)=>{
-                  const previsto = idx < ore;
+                {celle.length===0 && <div style={{gridColumn:"1 / -1",fontSize:12,color:"var(--color-text-tertiary)",padding:"6px 0"}}>Nessuna lezione prevista in questa giornata.</div>}
+                {celle.map(h=>{
+                  if (h === f.pausa) return (
+                    <div key={h} style={{height:58,borderRadius:"var(--border-radius-md)",border:"0.5px dashed var(--color-border-secondary)",display:"flex",flexDirection:"column",alignItems:"center",justifyContent:"center",gap:1,color:"var(--color-text-tertiary)"}}>
+                      <span style={{fontSize:11,opacity:0.8}}>{h}<span style={{opacity:0.6}}>→{HOUR_END[h]}</span></span>
+                      <span style={{fontSize:11}}>pausa</span>
+                    </div>
+                  );
                   const state = stateOf(s.id,h);
                   const info = state ? ST[state] : null;
                   return (
                     <div key={h} style={{position:"relative"}}>
-                      <button onClick={()=>cycleHour(s.id,h)} disabled={!previsto}
-                        title={previsto?"":"Non previsto dall'orario"}
-                        style={{width:"100%",height:58,borderRadius:"var(--border-radius-md)",cursor:previsto?"pointer":"default",display:"flex",flexDirection:"column",alignItems:"center",justifyContent:"center",gap:1,opacity:previsto?1:0.4,
+                      <button onClick={()=>cycleHour(s.id,h)}
+                        style={{width:"100%",height:58,borderRadius:"var(--border-radius-md)",cursor:"pointer",display:"flex",flexDirection:"column",alignItems:"center",justifyContent:"center",gap:1,
                           border:info?`1px solid ${info.fg}55`:"0.5px solid var(--color-border-tertiary)",
-                          background:!previsto?"transparent":(info?info.bg:"var(--color-background-secondary)"),
+                          background:info?info.bg:"var(--color-background-secondary)",
                           color:info?info.fg:"var(--color-text-tertiary)"}}>
                         <span style={{fontSize:11,opacity:0.8}}>{h}<span style={{opacity:0.6}}>→{HOUR_END[h]}</span></span>
-                        <span style={{fontSize:20,fontWeight:600}}>{previsto?(info?info.l:"·"):"–"}</span>
+                        <span style={{fontSize:20,fontWeight:600}}>{info?info.l:"·"}</span>
                       </button>
-                      {previsto && giustBadge(s.id,h,state,giustOf(s.id,h),20)}
+                      {giustBadge(s.id,h,state,giustOf(s.id,h),20)}
                     </div>
                   );
                 })}
@@ -621,15 +656,15 @@ function Registro({ ruolo, onLogout }) {
         <div style={{background:"var(--color-background-primary)",border:"0.5px solid var(--color-border-tertiary)",borderRadius:"var(--border-radius-lg)",overflow:"hidden"}}>
           <table style={{width:"100%",borderCollapse:"collapse",tableLayout:"fixed"}}>
             <colgroup>
-              <col style={{width:130}} />
+              <col style={{width:wide?116:130}} />
               <col style={{width:104}} />
-              {HOURS.map(h=><col key={h} style={{width:46}} />)}
+              {visibleHours.map(h=><col key={h} style={{width:wide?42:46}} />)}
             </colgroup>
             <thead>
               <tr style={{background:"var(--color-background-secondary)",borderBottom:"0.5px solid var(--color-border-tertiary)"}}>
                 <th style={{...th,textAlign:"left",padding:"8px 12px"}}>Studente</th>
                 <th style={th}>Tutta la giornata</th>
-                {HOURS.map(h=>(
+                {visibleHours.map(h=>(
                   <th key={h} style={th}>
                     <div>{h}</div>
                     <div style={{fontSize:10,color:"var(--color-text-tertiary)",fontWeight:400}}>→{HOUR_END[h]}</div>
@@ -638,12 +673,12 @@ function Registro({ ruolo, onLogout }) {
               </tr>
             </thead>
             <tbody>
-              {clsStudents.length===0 && <tr><td colSpan={8} style={{padding:"20px 14px",fontSize:13,color:"var(--color-text-tertiary)"}}>Nessuno studente.{isSegreteria?" Aggiungili dalla sezione Gestione.":""}</td></tr>}
+              {clsStudents.length===0 && <tr><td colSpan={visibleHours.length+2} style={{padding:"20px 14px",fontSize:13,color:"var(--color-text-tertiary)"}}>Nessuno studente.{isSegreteria?" Aggiungili dalla sezione Gestione.":""}</td></tr>}
               {clsStudents.map((s,i)=>{
-                const ore = oreOggi(s.id);
+                const f = fasceOggi(s.id);
                 return (
                 <tr key={s.id} style={{borderTop:i>0?"0.5px solid var(--color-border-tertiary)":"none"}}>
-                  <td style={{padding:"6px 12px",fontSize:13,opacity:ore===0?0.55:1}}>{s.nome}
+                  <td style={{padding:"6px 12px",fontSize:13,opacity:f.fasce.length===0?0.55:1}}>{s.nome}
                     {classNamesOf(s.id).length>1 && <span title="Iscritto a più classi" style={{fontSize:10,color:"var(--color-text-tertiary)",marginLeft:5}}>●</span>}
                   </td>
                   <td style={{textAlign:"center",padding:"4px 2px"}}>
@@ -658,16 +693,23 @@ function Registro({ ruolo, onLogout }) {
                       )}
                     </div>
                   </td>
-                  {HOURS.map((h,idx)=>{
-                    const previsto = idx < ore;
+                  {visibleHours.map(h=>{
+                    const isPausa = f.pausa === h;
+                    const previsto = f.fasce.includes(h);
                     const state = stateOf(s.id,h);
                     const info = state ? ST[state] : null;
+                    const cw = wide?36:40;
+                    if (isPausa) return (
+                      <td key={h} style={{textAlign:"center",padding:"4px 2px"}}>
+                        <span title="Pausa" style={{display:"inline-flex",alignItems:"center",justifyContent:"center",width:cw,height:30,borderRadius:"var(--border-radius-md)",border:"0.5px dashed var(--color-border-secondary)",fontSize:9,color:"var(--color-text-tertiary)"}}>pausa</span>
+                      </td>
+                    );
                     return (
                       <td key={h} style={{textAlign:"center",padding:"4px 2px"}}>
                         <div style={{position:"relative",display:"inline-block"}}>
                           <button onClick={()=>cycleHour(s.id,h)} disabled={!previsto}
                             title={previsto?(info?`${state} — clicca per cambiare`:"Clicca per segnare"):"Non previsto dall'orario"}
-                            style={{width:40,height:30,borderRadius:"var(--border-radius-md)",cursor:previsto?"pointer":"default",opacity:previsto?1:0.35,
+                            style={{width:cw,height:30,borderRadius:"var(--border-radius-md)",cursor:previsto?"pointer":"default",opacity:previsto?1:0.35,
                               border:info?`1px solid ${info.fg}44`:"0.5px solid var(--color-border-tertiary)",
                               background:info?info.bg:"transparent",color:info?info.fg:"var(--color-text-tertiary)",fontSize:13,fontWeight:info?500:400}}>
                             {previsto?(info?info.l:"·"):"–"}
@@ -684,7 +726,7 @@ function Registro({ ruolo, onLogout }) {
           </table>
         </div>
         <div style={{fontSize:11,color:"var(--color-text-tertiary)",marginTop:8,paddingLeft:2}}>
-          Le fasce con il trattino <strong>–</strong> non sono previste dall'orario dello studente. La pallina <strong>G</strong> segnala le giustificazioni{isSegreteria?" — cliccala per giustificare.":" (solo la segreteria può modificarle)."} Il pallino <strong>●</strong> indica chi è iscritto a più classi.
+          Le fasce con il trattino <strong>–</strong> non sono previste dall'orario dello studente; <strong>pausa</strong> indica l'ora di stacco fra mattina e pomeriggio. La pallina <strong>G</strong> segnala le giustificazioni{isSegreteria?" — cliccala per giustificare.":" (solo la segreteria può modificarle)."} Il pallino <strong>●</strong> indica chi è iscritto a più classi.
         </div>
       </div>
     );
@@ -771,19 +813,39 @@ function Registro({ ruolo, onLogout }) {
                     {openOrario===s.id && (
                       <div style={{padding:"10px 14px 14px",background:"var(--color-background-secondary)",borderTop:"0.5px solid var(--color-border-tertiary)"}}>
                         <div style={{fontSize:12,color:"var(--color-text-secondary)",marginBottom:8}}>Ore di lezione previste per ogni giorno della settimana:</div>
-                        <div style={{display:"flex",gap:10,flexWrap:"wrap"}}>
-                          {GIORNI.map((g,idx)=>(
-                            <div key={g} style={{display:"flex",flexDirection:"column",alignItems:"center",gap:4}}>
+                        <div style={{display:"flex",gap:12,flexWrap:"wrap"}}>
+                          {GIORNI.map((g,idx)=>{
+                            const gio = idx+1;
+                            const m = oreOf(s.id, gio);
+                            const p = pomOf(s.id, gio);
+                            const mp = maxPom(m);
+                            const f = { m, p };
+                            const fine = m>0 ? (p>0 ? HOUR_END[HOURS[m+p]] : HOUR_END[HOURS[m-1]]) : null;
+                            return (
+                            <div key={g} style={{display:"flex",flexDirection:"column",alignItems:"center",gap:4,minWidth:54}}>
                               <span style={{fontSize:11,color:"var(--color-text-tertiary)"}}>{g}</span>
-                              <select value={oreOf(s.id, idx+1)} onChange={e=>setOrario(s.id, idx+1, Number(e.target.value))}
-                                style={{...inp,padding:"4px 6px",background:"var(--color-background-primary)"}}>
+                              <select value={m} onChange={e=>setOrario(s.id, gio, Number(e.target.value), p)}
+                                style={{...inp,padding:"4px 6px",background:"var(--color-background-primary)",width:52}}>
                                 {[0,1,2,3,4,5,6].map(n=><option key={n} value={n}>{n}</option>)}
                               </select>
+                              {p>0 ? (
+                                <select value={p} onChange={e=>setOrario(s.id, gio, m, Number(e.target.value))}
+                                  style={{...inp,padding:"4px 6px",background:"#FAEEDA",borderColor:"#EF9F27",color:"#854F0B",width:52}}>
+                                  <option value={0}>–</option>
+                                  {Array.from({length:mp},(_,k)=>k+1).map(n=><option key={n} value={n}>+{n}</option>)}
+                                </select>
+                              ) : (
+                                <button onClick={()=>setOrario(s.id, gio, m, 1)} disabled={mp===0}
+                                  title={mp===0?"Non c'è spazio per il pomeriggio":"Aggiungi ore pomeridiane"}
+                                  style={{...inp,padding:"4px 6px",width:52,cursor:mp===0?"default":"pointer",opacity:mp===0?0.4:1,color:"var(--color-text-tertiary)"}}>+</button>
+                              )}
+                              {fine && <span style={{fontSize:9,color:"var(--color-text-tertiary)"}}>fino {fine}</span>}
                             </div>
-                          ))}
+                            );
+                          })}
                         </div>
-                        <div style={{fontSize:11,color:"var(--color-text-tertiary)",marginTop:8}}>
-                          Le ore si contano dalla prima fascia: 4 significa 8:30–12:30, 6 significa 8:30–14:30. Le modifiche si salvano subito.
+                        <div style={{fontSize:11,color:"var(--color-text-tertiary)",marginTop:10}}>
+                          Il primo selettore indica le ore del mattino a partire dalle 8:30 (5 = fino alle 13:30). Con <strong>+</strong> aggiungi le ore pomeridiane, che iniziano dopo <strong>un'ora di pausa</strong>: 5 ore + 2 pomeridiane significa 8:30–13:30, pausa, poi 14:30–16:30. Le modifiche si salvano subito.
                         </div>
                       </div>
                     )}
@@ -1091,7 +1153,7 @@ ${inner}
       XLSX.utils.book_append_sheet(wb, XLSX.utils.json_to_sheet(cl.map(c=>({ id:c.id, Nome:c.nome }))), "Classi");
       XLSX.utils.book_append_sheet(wb, XLSX.utils.json_to_sheet(st.map(s=>({ id:s.id, Nome:s.nome }))), "Studenti");
       XLSX.utils.book_append_sheet(wb, XLSX.utils.json_to_sheet(isc.map(i=>({ studente_id:i.studente_id, Studente:nomeStu[i.studente_id]||"", classe_id:i.classe_id, Classe:nomeCls[i.classe_id]||"" }))), "Iscrizioni");
-      XLSX.utils.book_append_sheet(wb, XLSX.utils.json_to_sheet(or_.map(o=>({ studente_id:o.studente_id, Studente:nomeStu[o.studente_id]||"", Giorno:GIORNI[o.giorno-1]||o.giorno, giorno_num:o.giorno, Ore:o.ore }))), "Orari");
+      XLSX.utils.book_append_sheet(wb, XLSX.utils.json_to_sheet(or_.map(o=>({ studente_id:o.studente_id, Studente:nomeStu[o.studente_id]||"", Giorno:GIORNI[o.giorno-1]||o.giorno, giorno_num:o.giorno, "Ore mattina":o.ore, "Ore pomeriggio":o.pom||0 }))), "Orari");
       XLSX.utils.book_append_sheet(wb, XLSX.utils.json_to_sheet(pres.map(p=>({ studente_id:p.studente_id, Studente:nomeStu[p.studente_id]||"", Data:p.data, Fascia:p.fascia, Stato:p.stato, Giustificato:p.giustificato?"Sì":"No" }))), "Presenze");
       const oggi = new Date().toISOString().split("T")[0];
       XLSX.writeFile(wb, `backup_registro_${oggi}.xlsx`);
