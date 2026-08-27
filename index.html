@@ -53,7 +53,7 @@ const RUOLI = {
 
 const HOURS = ['08:30','09:30','10:30','11:30','12:30','13:30'];
 const HOUR_END = {'08:30':'09:30','09:30':'10:30','10:30':'11:30','11:30':'12:30','12:30':'13:30','13:30':'14:30'};
-const MORNING = ['08:30','09:30','10:30','11:30'];
+const GIORNI = ["Lun","Mar","Mer","Gio","Ven","Sab"];
 const MESI = ["gennaio","febbraio","marzo","aprile","maggio","giugno","luglio","agosto","settembre","ottobre","novembre","dicembre"];
 const CYCLE = [null,'presente','assente','ritardo'];
 const ST = {
@@ -62,8 +62,10 @@ const ST = {
   ritardo:  { bg:'#FAEEDA', fg:'#854F0B', l:'R' },
 };
 const PRES_COLS = "id,studente_id,fascia,stato,giustificato";
+const IDLE_MS = 15 * 60 * 1000;   // oltre questo tempo di inattività il refresh si sospende
+const POLL_MS = 25000;
 
-/* ---------- comunicazione con Supabase ---------- */
+/* ================= comunicazione con Supabase ================= */
 
 async function raw(path, opts = {}, token) {
   const res = await fetch(`${SUPABASE_URL}/rest/v1/${path}`, {
@@ -80,18 +82,14 @@ async function raw(path, opts = {}, token) {
   return txt ? JSON.parse(txt) : null;
 }
 
-/* ---------- gestione sessione con rinnovo automatico ---------- */
+/* ---- sessione con rinnovo automatico ---- */
 
 let SESS = null;
 let onSessionLost = null;
 let refreshing = null;
 
 function setSession(d) {
-  SESS = {
-    token: d.access_token,
-    refresh: d.refresh_token,
-    expiresAt: Date.now() + ((d.expires_in || 3600) * 1000),
-  };
+  SESS = { token: d.access_token, refresh: d.refresh_token, expiresAt: Date.now() + ((d.expires_in || 3600) * 1000) };
 }
 function clearSession() { SESS = null; }
 
@@ -104,17 +102,12 @@ async function renewSession() {
       headers: { apikey: SUPABASE_KEY, "Content-Type": "application/json" },
       body: JSON.stringify({ refresh_token: SESS.refresh }),
     });
-    if (!res.ok) {
-      clearSession();
-      if (onSessionLost) onSessionLost();
-      throw new Error("Sessione scaduta");
-    }
+    if (!res.ok) { clearSession(); if (onSessionLost) onSessionLost(); throw new Error("Sessione scaduta"); }
     setSession(await res.json());
   })();
   try { await refreshing; } finally { refreshing = null; }
 }
 
-// Usata da tutta l'app: rinnova il token prima che scada e riprova in caso di 401
 async function api(path, opts = {}) {
   if (!SESS) throw new Error("Sessione scaduta");
   if (Date.now() > SESS.expiresAt - 120000) await renewSession();
@@ -129,6 +122,24 @@ async function api(path, opts = {}) {
   }
 }
 
+// Scrittura senza corpo di risposta (traffico minimo)
+const WRITE = { Prefer: "resolution=merge-duplicates,return=minimal" };
+// Scrittura che restituisce le righe salvate (serve per conoscere gli id)
+const WRITE_BACK = { Prefer: "resolution=merge-duplicates,return=representation" };
+
+// Scarica tabelle grandi a blocchi, per non dipendere da eventuali limiti di righe
+async function fetchAllRows(base) {
+  const out = []; const step = 1000; let from = 0;
+  while (true) {
+    const chunk = await api(`${base}&limit=${step}&offset=${from}`);
+    if (!chunk || !chunk.length) break;
+    out.push(...chunk);
+    if (chunk.length < step) break;
+    from += step;
+  }
+  return out;
+}
+
 async function signIn(email, password) {
   const res = await fetch(`${SUPABASE_URL}/auth/v1/token?grant_type=password`, {
     method: "POST",
@@ -139,7 +150,7 @@ async function signIn(email, password) {
   return res.json();
 }
 
-/* ---------- utilità date ---------- */
+/* ================= utilità ================= */
 
 function monthRange(ym) {
   const [y, m] = ym.split("-").map(Number);
@@ -147,11 +158,59 @@ function monthRange(ym) {
   return { start: `${ym}-01`, endExcl: `${nm}-01` };
 }
 
-// Anno scolastico: 1 settembre → 31 agosto
 function schoolYearRange(dateStr) {
   const [y, m] = dateStr.split("-").map(Number);
   const sy = m >= 9 ? y : y - 1;
   return { start: `${sy}-09-01`, endExcl: `${sy+1}-09-01`, label: `${sy}/${sy+1}` };
+}
+
+// 0 = domenica, 1 = lunedì … 6 = sabato
+function weekdayOf(dateStr) {
+  const [y,m,d] = dateStr.split("-").map(Number);
+  return new Date(Date.UTC(y, m-1, d)).getUTCDay();
+}
+function nomeGiorno(dateStr) {
+  const w = weekdayOf(dateStr);
+  return w === 0 ? "Dom" : GIORNI[w-1];
+}
+function itDate(d) { return d.split("-").reverse().join("/"); }
+
+// Ore previste da orario: se non impostato, 6 da lunedì a venerdì e 0 il sabato
+function oreProviste(orari, sid, dateStr) {
+  const w = weekdayOf(dateStr);
+  if (w === 0) return 0;
+  const rec = orari.find(o => o.studente_id === sid && o.giorno === w);
+  if (rec) return rec.ore;
+  return w === 6 ? 0 : 6;
+}
+
+// Calcola giorni di assenza e ore, rispettando l'orario di ciascuno
+function analizza(rows, orari, sid) {
+  const byDay = {};
+  rows.forEach(r => { (byDay[r.data] = byDay[r.data] || []).push(r); });
+  let pr=0, as=0, ri=0, gi=0;
+  const giorniAss = [];
+  const oreParziali = [];
+  rows.forEach(r => {
+    if (r.stato==='presente') pr++; else if (r.stato==='assente') as++; else if (r.stato==='ritardo') ri++;
+    if (r.giustificato && (r.stato==='assente' || r.stato==='ritardo')) gi++;
+  });
+  Object.keys(byDay).sort().forEach(d => {
+    const ore = oreProviste(orari, sid, d);
+    const fasce = HOURS.slice(0, ore);
+    const rs = byDay[d];
+    const assenti = rs.filter(r => fasce.includes(r.fascia) && r.stato === 'assente');
+    const interoGiorno = ore > 0 && assenti.length === ore;
+    if (interoGiorno) {
+      giorniAss.push({ data: d, ore, giustificato: assenti.every(r => r.giustificato) });
+    } else {
+      rs.filter(r => r.stato === 'assente' || r.stato === 'ritardo')
+        .sort((a,b) => HOURS.indexOf(a.fascia) - HOURS.indexOf(b.fascia))
+        .forEach(r => oreParziali.push({ data: d, fascia: r.fascia, stato: r.stato, giustificato: r.giustificato }));
+    }
+  });
+  return { pr, as, ri, gi, giorniAss, oreParziali,
+    gAss: giorniAss.length, gGiust: giorniAss.filter(g=>g.giustificato).length };
 }
 
 function useIsMobile() {
@@ -164,7 +223,7 @@ function useIsMobile() {
   return m;
 }
 
-/* ---------- schermata di accesso ---------- */
+/* ================= accesso ================= */
 
 function Login({ onLogin, notice }) {
   const [ruolo, setRuolo] = useState("docente");
@@ -174,12 +233,9 @@ function Login({ onLogin, notice }) {
 
   const entra = async () => {
     setErr(null); setBusy(true);
-    try {
-      const data = await signIn(RUOLI[ruolo].email, pw);
-      onLogin(data, ruolo);
-    } catch (e) {
-      setErr("Password non corretta. Riprova.");
-    } finally { setBusy(false); }
+    try { onLogin(await signIn(RUOLI[ruolo].email, pw), ruolo); }
+    catch (e) { setErr("Password non corretta. Riprova."); }
+    finally { setBusy(false); }
   };
 
   const card = {fontSize:14,padding:"7px 14px",borderRadius:"var(--border-radius-md)",cursor:"pointer",border:"0.5px solid var(--color-border-secondary)",background:"transparent",color:"var(--color-text-primary)"};
@@ -194,9 +250,7 @@ function Login({ onLogin, notice }) {
       <div style={{fontSize:13,color:"var(--color-text-secondary)",marginBottom:24,textAlign:"center"}}>Accedi per continuare</div>
 
       {notice && (
-        <div style={{fontSize:13,padding:"9px 12px",marginBottom:16,borderRadius:"var(--border-radius-md)",background:"var(--color-background-secondary)",border:"0.5px solid var(--color-border-secondary)",color:"var(--color-text-secondary)"}}>
-          {notice}
-        </div>
+        <div style={{fontSize:13,padding:"9px 12px",marginBottom:16,borderRadius:"var(--border-radius-md)",background:"var(--color-background-secondary)",border:"0.5px solid var(--color-border-secondary)",color:"var(--color-text-secondary)"}}>{notice}</div>
       )}
 
       <div style={{fontSize:12,color:"var(--color-text-tertiary)",textTransform:"uppercase",letterSpacing:"0.05em",marginBottom:8}}>Ruolo</div>
@@ -224,20 +278,15 @@ function Login({ onLogin, notice }) {
 function App() {
   const [ruolo, setRuolo] = useState(null);
   const [notice, setNotice] = useState(null);
-
   useEffect(() => {
     onSessionLost = () => { setRuolo(null); setNotice("La sessione è scaduta per inattività prolungata. Accedi di nuovo."); };
     return () => { onSessionLost = null; };
   }, []);
-
-  const handleLogin = (data, r) => { setSession(data); setNotice(null); setRuolo(r); };
-  const handleLogout = () => { clearSession(); setNotice(null); setRuolo(null); };
-
-  if (!ruolo) return <Login onLogin={handleLogin} notice={notice} />;
-  return <Registro ruolo={ruolo} onLogout={handleLogout} />;
+  if (!ruolo) return <Login notice={notice} onLogin={(d,r)=>{ setSession(d); setNotice(null); setRuolo(r); }} />;
+  return <Registro ruolo={ruolo} onLogout={()=>{ clearSession(); setNotice(null); setRuolo(null); }} />;
 }
 
-/* ---------- app principale ---------- */
+/* ================= app principale ================= */
 
 function Registro({ ruolo, onLogout }) {
   const isSegreteria = ruolo === "segreteria";
@@ -245,6 +294,7 @@ function Registro({ ruolo, onLogout }) {
   const [classes, setClasses] = useState([]);
   const [students, setStudents] = useState([]);
   const [iscrizioni, setIscrizioni] = useState([]);
+  const [orari, setOrari] = useState([]);
   const [presenze, setPresenze] = useState([]);
   const [selCls, setSelCls] = useState(null);
   const [date, setDate] = useState(new Date().toISOString().split("T")[0]);
@@ -257,7 +307,9 @@ function Registro({ ruolo, onLogout }) {
   const [addExist, setAddExist] = useState("");
   const [editCls, setEditCls] = useState(null);
   const [editStu, setEditStu] = useState(null);
+  const [openOrario, setOpenOrario] = useState(null);
   const noticeTimer = useRef(null);
+  const lastAct = useRef(Date.now());
 
   const say = useCallback((m) => {
     setNotice(m);
@@ -265,14 +317,10 @@ function Registro({ ruolo, onLogout }) {
     noticeTimer.current = setTimeout(()=>setNotice(null), 5000);
   }, []);
 
-  // Distingue il divieto sui dati giustificati da un errore vero
   const handleErr = useCallback((e, ctx) => {
     const m = String(e && e.message || "");
-    if (m.startsWith("403")) {
-      say("Questa registrazione è stata giustificata dalla segreteria: solo la segreteria può modificarla.");
-    } else {
-      setErr((ctx ? ctx + ": " : "") + m);
-    }
+    if (m.startsWith("403")) say("Questa registrazione è stata giustificata dalla segreteria: solo la segreteria può modificarla.");
+    else setErr((ctx ? ctx + ": " : "") + m);
   }, [say]);
 
   const cls = classes.find(c => c.id === selCls);
@@ -284,12 +332,13 @@ function Registro({ ruolo, onLogout }) {
 
   const loadAll = useCallback(async () => {
     try {
-      const [c, s, i] = await Promise.all([
+      const [c, s, i, o] = await Promise.all([
         api("classi?select=*&order=nome"),
         api("studenti?select=*&order=nome"),
         api("iscrizioni?select=*"),
+        api("orari?select=*"),
       ]);
-      setClasses(c || []); setStudents(s || []); setIscrizioni(i || []);
+      setClasses(c || []); setStudents(s || []); setIscrizioni(i || []); setOrari(o || []);
       setSelCls(prev => prev || (c && c.length ? c[0].id : null));
       setErr(null);
     } catch (e) {
@@ -297,13 +346,11 @@ function Registro({ ruolo, onLogout }) {
     } finally { setLoading(false); }
   }, []);
 
-  // Scarica SOLO le presenze della classe selezionata e solo le colonne necessarie
   const loadPresenze = useCallback(async () => {
     if (!idsKey) { setPresenze([]); return; }
     try {
       const p = await api(`presenze?select=${PRES_COLS}&data=eq.${date}&studente_id=in.(${idsKey})`);
-      setPresenze(p || []);
-      setErr(null);
+      setPresenze(p || []); setErr(null);
     } catch (e) {
       setErr("Errore nel caricare le presenze: " + (e.message||""));
     }
@@ -312,59 +359,78 @@ function Registro({ ruolo, onLogout }) {
   useEffect(() => { loadAll(); }, [loadAll]);
   useEffect(() => { loadPresenze(); }, [loadPresenze]);
 
-  // Aggiornamento automatico solo nella vista Registro e solo a schermo visibile
+  // Traccia l'attività per sospendere il refresh su dispositivi lasciati aperti
+  useEffect(() => {
+    const touch = () => { lastAct.current = Date.now(); };
+    window.addEventListener("pointerdown", touch);
+    window.addEventListener("keydown", touch);
+    return () => { window.removeEventListener("pointerdown", touch); window.removeEventListener("keydown", touch); };
+  }, []);
+
+  // Refresh solo nella vista Registro, a schermo visibile e con utente attivo
   useEffect(() => {
     if (view !== "reg") return;
-    const refresh = () => { if (!document.hidden) loadPresenze(); };
-    const onVis = () => { if (!document.hidden) { loadPresenze(); loadAll(); } };
-    window.addEventListener("focus", refresh);
-    document.addEventListener("visibilitychange", onVis);
-    const t = setInterval(refresh, 25000);
+    const tick = () => { if (!document.hidden && Date.now() - lastAct.current < IDLE_MS) loadPresenze(); };
+    const onBack = () => { if (!document.hidden) { lastAct.current = Date.now(); loadPresenze(); } };
+    window.addEventListener("focus", onBack);
+    document.addEventListener("visibilitychange", onBack);
+    const t = setInterval(tick, POLL_MS);
     return () => {
-      window.removeEventListener("focus", refresh);
-      document.removeEventListener("visibilitychange", onVis);
+      window.removeEventListener("focus", onBack);
+      document.removeEventListener("visibilitychange", onBack);
       clearInterval(t);
     };
-  }, [view, loadPresenze, loadAll]);
+  }, [view, loadPresenze]);
 
   const presKey = (sid, h) => presenze.find(p => p.studente_id === sid && p.fascia === h);
   const stateOf = (sid, h) => presKey(sid, h)?.stato || null;
   const giustOf = (sid, h) => presKey(sid, h)?.giustificato || false;
+  const oreOggi = (sid) => oreProviste(orari, sid, date);
+  const oreOf = (sid, giorno) => {
+    const rec = orari.find(o => o.studente_id === sid && o.giorno === giorno);
+    return rec ? rec.ore : (giorno === 6 ? 0 : 6);
+  };
+
+  const mergeLocal = (rows) => setPresenze(prev => {
+    const map = new Map(prev.map(p => [p.studente_id + "|" + p.fascia, p]));
+    rows.forEach(r => map.set(r.studente_id + "|" + r.fascia, r));
+    return Array.from(map.values());
+  });
 
   const cycleHour = async (sid, h) => {
+    if (!HOURS.slice(0, oreOggi(sid)).includes(h)) {
+      say("Questa fascia non è prevista dall'orario dello studente.");
+      return;
+    }
     const existing = presKey(sid, h);
     if (!isSegreteria && existing && existing.giustificato) {
       say("Ora giustificata dalla segreteria: solo la segreteria può modificarla.");
       return;
     }
     const next = CYCLE[(CYCLE.indexOf(existing?.stato || null) + 1) % CYCLE.length];
-    setPresenze(prev => {
-      const others = prev.filter(p => !(p.studente_id === sid && p.fascia === h));
-      return next ? [...others, { ...(existing||{}), studente_id: sid, fascia: h, stato: next, giustificato: false }] : others;
-    });
     try {
       if (next === null) {
         if (existing?.id) await api(`presenze?id=eq.${existing.id}`, { method: "DELETE" });
+        setPresenze(prev => prev.filter(p => !(p.studente_id === sid && p.fascia === h)));
       } else {
-        await api("presenze?on_conflict=studente_id,data,fascia", {
-          method: "POST",
-          headers: { Prefer: "resolution=merge-duplicates" },
+        const saved = await api("presenze?on_conflict=studente_id,data,fascia", {
+          method: "POST", headers: WRITE_BACK,
           body: JSON.stringify({ studente_id: sid, data: date, fascia: h, stato: next, giustificato: false }),
         });
+        mergeLocal(saved || []);
       }
-      loadPresenze();
     } catch (e) { handleErr(e, "Salvataggio"); loadPresenze(); }
   };
 
   const setAll = async (sid, status) => {
+    const fasce = HOURS.slice(0, oreOggi(sid));
+    if (!fasce.length) { say("Nessuna ora prevista dall'orario per questo giorno."); return; }
     try {
-      const rows = HOURS.map(h => ({ studente_id: sid, data: date, fascia: h, stato: status, giustificato: false }));
-      await api("presenze?on_conflict=studente_id,data,fascia", {
-        method: "POST",
-        headers: { Prefer: "resolution=merge-duplicates" },
-        body: JSON.stringify(rows),
+      const saved = await api("presenze?on_conflict=studente_id,data,fascia", {
+        method: "POST", headers: WRITE_BACK,
+        body: JSON.stringify(fasce.map(h => ({ studente_id: sid, data: date, fascia: h, stato: status, giustificato: false }))),
       });
-      loadPresenze();
+      mergeLocal(saved || []);
     } catch (e) { handleErr(e); loadPresenze(); }
   };
 
@@ -372,35 +438,41 @@ function Registro({ ruolo, onLogout }) {
     if (!isSegreteria) return;
     const existing = presKey(sid, h);
     if (!existing || !existing.stato) return;
-    const newVal = !existing.giustificato;
-    setPresenze(prev => prev.map(p => (p.studente_id===sid && p.fascia===h) ? { ...p, giustificato:newVal } : p));
     try {
-      await api("presenze?on_conflict=studente_id,data,fascia", {
-        method: "POST",
-        headers: { Prefer: "resolution=merge-duplicates" },
-        body: JSON.stringify({ studente_id: sid, data: date, fascia: h, stato: existing.stato, giustificato: newVal }),
+      const saved = await api("presenze?on_conflict=studente_id,data,fascia", {
+        method: "POST", headers: WRITE_BACK,
+        body: JSON.stringify({ studente_id: sid, data: date, fascia: h, stato: existing.stato, giustificato: !existing.giustificato }),
       });
-      loadPresenze();
+      mergeLocal(saved || []);
     } catch (e) { handleErr(e); loadPresenze(); }
   };
 
   const giustDay = async (sid) => {
     if (!isSegreteria) return;
     const rows = presenze.filter(p => p.studente_id===sid && (p.stato==='assente' || p.stato==='ritardo'));
-    if (!rows.length) {
-      say("Nessuna assenza o ritardo registrato per questo studente in questa giornata.");
-      return;
-    }
+    if (!rows.length) { say("Nessuna assenza o ritardo registrato per questo studente in questa giornata."); return; }
     const newVal = !rows.every(r => r.giustificato);
     try {
-      await api("presenze?on_conflict=studente_id,data,fascia", {
-        method: "POST",
-        headers: { Prefer: "resolution=merge-duplicates" },
+      const saved = await api("presenze?on_conflict=studente_id,data,fascia", {
+        method: "POST", headers: WRITE_BACK,
         body: JSON.stringify(rows.map(r => ({ studente_id: sid, data: date, fascia: r.fascia, stato: r.stato, giustificato: newVal }))),
       });
+      mergeLocal(saved || []);
       say(newVal ? "Giornata giustificata." : "Giustificazione rimossa.");
-      loadPresenze();
     } catch (e) { handleErr(e); loadPresenze(); }
+  };
+
+  const setOrario = async (sid, giorno, ore) => {
+    setOrari(prev => {
+      const others = prev.filter(o => !(o.studente_id===sid && o.giorno===giorno));
+      return [...others, { studente_id: sid, giorno, ore }];
+    });
+    try {
+      await api("orari?on_conflict=studente_id,giorno", {
+        method: "POST", headers: WRITE,
+        body: JSON.stringify({ studente_id: sid, giorno, ore }),
+      });
+    } catch (e) { handleErr(e); loadAll(); }
   };
 
   const addCls = async () => {
@@ -417,10 +489,9 @@ function Registro({ ruolo, onLogout }) {
     try {
       const [s] = await api("studenti", { method: "POST", headers: { Prefer: "return=representation" }, body: JSON.stringify({ nome }) });
       created = s;
-      if (s) await api("iscrizioni", { method: "POST", body: JSON.stringify({ studente_id: s.id, classe_id: cls.id }) });
+      if (s) await api("iscrizioni", { method: "POST", headers: { Prefer: "return=minimal" }, body: JSON.stringify({ studente_id: s.id, classe_id: cls.id }) });
       setNewStu(""); loadAll();
     } catch (e) {
-      // evita studenti "orfani" se l'iscrizione fallisce
       if (created?.id) { try { await api(`studenti?id=eq.${created.id}`, { method: "DELETE" }); } catch(_){} }
       handleErr(e);
     }
@@ -429,7 +500,7 @@ function Registro({ ruolo, onLogout }) {
   const enrollExisting = async () => {
     if (!addExist || !cls) return;
     try {
-      await api("iscrizioni?on_conflict=studente_id,classe_id", { method: "POST", headers: { Prefer: "resolution=merge-duplicates" }, body: JSON.stringify({ studente_id: addExist, classe_id: cls.id }) });
+      await api("iscrizioni?on_conflict=studente_id,classe_id", { method: "POST", headers: WRITE, body: JSON.stringify({ studente_id: addExist, classe_id: cls.id }) });
       setAddExist(""); loadAll();
     } catch (e) { handleErr(e); }
   };
@@ -439,8 +510,9 @@ function Registro({ ruolo, onLogout }) {
       const affected = iscrizioni.filter(x=>x.classe_id===id).map(x=>x.studente_id);
       await api(`classi?id=eq.${id}`, { method: "DELETE" });
       for (const sid of affected) {
-        const others = iscrizioni.filter(x=>x.studente_id===sid && x.classe_id!==id);
-        if (others.length===0) { try { await api(`studenti?id=eq.${sid}`, { method: "DELETE" }); } catch(_){} }
+        if (iscrizioni.filter(x=>x.studente_id===sid && x.classe_id!==id).length===0) {
+          try { await api(`studenti?id=eq.${sid}`, { method: "DELETE" }); } catch(_){}
+        }
       }
       if (selCls===id) setSelCls(null);
       loadAll();
@@ -449,23 +521,23 @@ function Registro({ ruolo, onLogout }) {
 
   const remStu = async (sid) => {
     try {
-      const isc = iscrizioni.find(x=>x.studente_id===sid && x.classe_id===selCls);
-      if (isc) await api(`iscrizioni?id=eq.${isc.id}`, { method: "DELETE" });
-      const others = iscrizioni.filter(x=>x.studente_id===sid && x.classe_id!==selCls);
-      if (others.length===0) await api(`studenti?id=eq.${sid}`, { method: "DELETE" });
+      await api(`iscrizioni?studente_id=eq.${sid}&classe_id=eq.${selCls}`, { method: "DELETE" });
+      if (iscrizioni.filter(x=>x.studente_id===sid && x.classe_id!==selCls).length===0) {
+        await api(`studenti?id=eq.${sid}`, { method: "DELETE" });
+      }
       loadAll();
     } catch (e) { handleErr(e); }
   };
 
   const renameCls = async (id, nome) => {
     const n = (nome||"").trim(); if (!n) return;
-    try { await api(`classi?id=eq.${id}`, { method: "PATCH", body: JSON.stringify({ nome:n }) }); setEditCls(null); loadAll(); }
+    try { await api(`classi?id=eq.${id}`, { method: "PATCH", headers:{Prefer:"return=minimal"}, body: JSON.stringify({ nome:n }) }); setEditCls(null); loadAll(); }
     catch (e) { handleErr(e); }
   };
 
   const renameStu = async (id, nome) => {
     const n = (nome||"").trim(); if (!n) return;
-    try { await api(`studenti?id=eq.${id}`, { method: "PATCH", body: JSON.stringify({ nome:n }) }); setEditStu(null); loadAll(); }
+    try { await api(`studenti?id=eq.${id}`, { method: "PATCH", headers:{Prefer:"return=minimal"}, body: JSON.stringify({ nome:n }) }); setEditStu(null); loadAll(); }
     catch (e) { handleErr(e); }
   };
 
@@ -475,8 +547,8 @@ function Registro({ ruolo, onLogout }) {
   const th = {fontSize:11,color:"var(--color-text-secondary)",fontWeight:400,textTransform:"uppercase",letterSpacing:"0.04em",padding:"8px 4px",textAlign:"center"};
 
   const giustBadge = (sid,h,state,giust,size) => {
-    const canGiust = state==='assente' || state==='ritardo';
-    if (!canGiust || !(giust || isSegreteria)) return null;
+    if (!(state==='assente' || state==='ritardo')) return null;
+    if (!(giust || isSegreteria)) return null;
     const sz = size || 15;
     return (
       <span onClick={(e)=>{e.stopPropagation();toggleGiust(sid,h);}}
@@ -484,66 +556,61 @@ function Registro({ ruolo, onLogout }) {
         style={{position:"absolute",top:-sz/3,right:-sz/3,width:sz,height:sz,borderRadius:"50%",fontSize:sz*0.6,fontWeight:600,lineHeight:sz+"px",textAlign:"center",cursor:isSegreteria?"pointer":"default",
           background:giust?"#3B6D11":"var(--color-background-primary)",
           color:giust?"#fff":"var(--color-text-tertiary)",
-          border:giust?"1px solid #3B6D11":"1px solid var(--color-border-secondary)"}}>
-        G
-      </span>
+          border:giust?"1px solid #3B6D11":"1px solid var(--color-border-secondary)"}}>G</span>
     );
   };
 
   const registerView = () => {
-    if (!cls) {
-      return classes.length>0
-        ? <div style={{padding:"20px 0",color:"var(--color-text-tertiary)",fontSize:14}}>Seleziona una classe.</div>
-        : null;
-    }
+    if (!cls) return classes.length>0 ? <div style={{padding:"20px 0",color:"var(--color-text-tertiary)",fontSize:14}}>Seleziona una classe.</div> : null;
 
     if (isMobile) {
       return (
         <div>
-          {clsStudents.length===0 && (
-            <div style={{padding:"16px 4px",fontSize:14,color:"var(--color-text-tertiary)"}}>Nessuno studente.{isSegreteria?" Aggiungili dalla sezione Gestione.":""}</div>
-          )}
-          {clsStudents.map(s=>(
+          {clsStudents.length===0 && <div style={{padding:"16px 4px",fontSize:14,color:"var(--color-text-tertiary)"}}>Nessuno studente.{isSegreteria?" Aggiungili dalla sezione Gestione.":""}</div>}
+          {clsStudents.map(s=>{
+            const ore = oreOggi(s.id);
+            return (
             <div key={s.id} style={{background:"var(--color-background-primary)",border:"0.5px solid var(--color-border-tertiary)",borderRadius:"var(--border-radius-lg)",padding:"12px 12px 14px",marginBottom:10}}>
               <div style={{display:"flex",alignItems:"center",gap:8,marginBottom:10}}>
-                <span style={{flex:1,fontSize:15,fontWeight:500}}>{s.nome}{classNamesOf(s.id).length>1 && <span style={{fontSize:11,fontWeight:400,color:"var(--color-text-tertiary)",marginLeft:6}}>· più classi</span>}</span>
+                <span style={{flex:1,fontSize:15,fontWeight:500}}>{s.nome}
+                  {classNamesOf(s.id).length>1 && <span style={{fontSize:11,fontWeight:400,color:"var(--color-text-tertiary)",marginLeft:6}}>· più classi</span>}
+                  {ore===0 && <span style={{fontSize:11,fontWeight:400,color:"var(--color-text-tertiary)",marginLeft:6}}>· nessuna lezione</span>}
+                </span>
                 {CYCLE.filter(Boolean).map(st=>(
                   <button key={st} onClick={()=>setAll(s.id,st)} title={`Tutta la giornata: ${st}`}
-                    style={{width:30,height:30,borderRadius:6,cursor:"pointer",border:`1px solid ${ST[st].fg}55`,background:ST[st].bg,color:ST[st].fg,fontSize:13,fontWeight:600}}>
-                    {ST[st].l}
-                  </button>
+                    style={{width:30,height:30,borderRadius:6,cursor:"pointer",border:`1px solid ${ST[st].fg}55`,background:ST[st].bg,color:ST[st].fg,fontSize:13,fontWeight:600}}>{ST[st].l}</button>
                 ))}
                 {isSegreteria && (
                   <button onClick={()=>giustDay(s.id)} title="Giustifica tutta la giornata"
-                    style={{width:30,height:30,borderRadius:6,cursor:"pointer",border:"1px solid #3B6D11",background:"#fff",color:"#3B6D11",fontSize:13,fontWeight:600}}>
-                    G
-                  </button>
+                    style={{width:30,height:30,borderRadius:6,cursor:"pointer",border:"1px solid #3B6D11",background:"#fff",color:"#3B6D11",fontSize:13,fontWeight:600}}>G</button>
                 )}
               </div>
               <div style={{display:"grid",gridTemplateColumns:"repeat(3,1fr)",gap:8}}>
-                {HOURS.map(h=>{
+                {HOURS.map((h,idx)=>{
+                  const previsto = idx < ore;
                   const state = stateOf(s.id,h);
                   const info = state ? ST[state] : null;
-                  const giust = giustOf(s.id,h);
                   return (
                     <div key={h} style={{position:"relative"}}>
-                      <button onClick={()=>cycleHour(s.id,h)}
-                        style={{width:"100%",height:58,borderRadius:"var(--border-radius-md)",cursor:"pointer",display:"flex",flexDirection:"column",alignItems:"center",justifyContent:"center",gap:1,
+                      <button onClick={()=>cycleHour(s.id,h)} disabled={!previsto}
+                        title={previsto?"":"Non previsto dall'orario"}
+                        style={{width:"100%",height:58,borderRadius:"var(--border-radius-md)",cursor:previsto?"pointer":"default",display:"flex",flexDirection:"column",alignItems:"center",justifyContent:"center",gap:1,opacity:previsto?1:0.4,
                           border:info?`1px solid ${info.fg}55`:"0.5px solid var(--color-border-tertiary)",
-                          background:info?info.bg:"var(--color-background-secondary)",
+                          background:!previsto?"transparent":(info?info.bg:"var(--color-background-secondary)"),
                           color:info?info.fg:"var(--color-text-tertiary)"}}>
                         <span style={{fontSize:11,opacity:0.8}}>{h}<span style={{opacity:0.6}}>→{HOUR_END[h]}</span></span>
-                        <span style={{fontSize:20,fontWeight:600}}>{info?info.l:"·"}</span>
+                        <span style={{fontSize:20,fontWeight:600}}>{previsto?(info?info.l:"·"):"–"}</span>
                       </button>
-                      {giustBadge(s.id,h,state,giust,20)}
+                      {previsto && giustBadge(s.id,h,state,giustOf(s.id,h),20)}
                     </div>
                   );
                 })}
               </div>
             </div>
-          ))}
+            );
+          })}
           <div style={{fontSize:11,color:"var(--color-text-tertiary)",marginTop:4,paddingLeft:2}}>
-            Tocca una fascia per ciclare presente → assente → ritardo → vuoto. La pallina <strong>G</strong> indica le giustificazioni{isSegreteria?" — toccala per giustificare.":"."}
+            Le fasce con il trattino non sono previste dall'orario dello studente. La pallina <strong>G</strong> indica le giustificazioni{isSegreteria?" — toccala per giustificare.":"."}
           </div>
         </div>
       );
@@ -571,52 +638,53 @@ function Registro({ ruolo, onLogout }) {
               </tr>
             </thead>
             <tbody>
-              {clsStudents.length===0 && (
-                <tr><td colSpan={8} style={{padding:"20px 14px",fontSize:13,color:"var(--color-text-tertiary)"}}>Nessuno studente.{isSegreteria?" Aggiungili dalla sezione Gestione.":""}</td></tr>
-              )}
-              {clsStudents.map((s,i)=>(
+              {clsStudents.length===0 && <tr><td colSpan={8} style={{padding:"20px 14px",fontSize:13,color:"var(--color-text-tertiary)"}}>Nessuno studente.{isSegreteria?" Aggiungili dalla sezione Gestione.":""}</td></tr>}
+              {clsStudents.map((s,i)=>{
+                const ore = oreOggi(s.id);
+                return (
                 <tr key={s.id} style={{borderTop:i>0?"0.5px solid var(--color-border-tertiary)":"none"}}>
-                  <td style={{padding:"6px 12px",fontSize:13}}>{s.nome}{classNamesOf(s.id).length>1 && <span title="Iscritto a più classi" style={{fontSize:10,color:"var(--color-text-tertiary)",marginLeft:5}}>●</span>}</td>
+                  <td style={{padding:"6px 12px",fontSize:13,opacity:ore===0?0.55:1}}>{s.nome}
+                    {classNamesOf(s.id).length>1 && <span title="Iscritto a più classi" style={{fontSize:10,color:"var(--color-text-tertiary)",marginLeft:5}}>●</span>}
+                  </td>
                   <td style={{textAlign:"center",padding:"4px 2px"}}>
                     <div style={{display:"flex",justifyContent:"center",gap:3}}>
                       {CYCLE.filter(Boolean).map(st=>(
                         <button key={st} onClick={()=>setAll(s.id,st)} title={`Segna tutto come ${st}`}
-                          style={{width:24,height:24,borderRadius:4,cursor:"pointer",border:`1px solid ${ST[st].fg}55`,background:ST[st].bg,color:ST[st].fg,fontSize:11,fontWeight:500}}>
-                          {ST[st].l}
-                        </button>
+                          style={{width:24,height:24,borderRadius:4,cursor:"pointer",border:`1px solid ${ST[st].fg}55`,background:ST[st].bg,color:ST[st].fg,fontSize:11,fontWeight:500}}>{ST[st].l}</button>
                       ))}
                       {isSegreteria && (
-                        <button onClick={()=>giustDay(s.id)} title="Giustifica tutte le assenze/ritardi della giornata"
-                          style={{width:24,height:24,borderRadius:4,cursor:"pointer",border:"1px solid #3B6D11",background:"#fff",color:"#3B6D11",fontSize:11,fontWeight:600}}>
-                          G
-                        </button>
+                        <button onClick={()=>giustDay(s.id)} title="Giustifica le assenze e i ritardi della giornata"
+                          style={{width:24,height:24,borderRadius:4,cursor:"pointer",border:"1px solid #3B6D11",background:"#fff",color:"#3B6D11",fontSize:11,fontWeight:600}}>G</button>
                       )}
                     </div>
                   </td>
-                  {HOURS.map(h=>{
+                  {HOURS.map((h,idx)=>{
+                    const previsto = idx < ore;
                     const state = stateOf(s.id,h);
                     const info = state ? ST[state] : null;
-                    const giust = giustOf(s.id,h);
                     return (
                       <td key={h} style={{textAlign:"center",padding:"4px 2px"}}>
                         <div style={{position:"relative",display:"inline-block"}}>
-                          <button onClick={()=>cycleHour(s.id,h)}
-                            title={info?`${state} — clicca per cambiare`:"Clicca per segnare"}
-                            style={{width:40,height:30,borderRadius:"var(--border-radius-md)",cursor:"pointer",border:info?`1px solid ${info.fg}44`:"0.5px solid var(--color-border-tertiary)",background:info?info.bg:"transparent",color:info?info.fg:"var(--color-text-tertiary)",fontSize:13,fontWeight:info?500:400}}>
-                            {info?info.l:"·"}
+                          <button onClick={()=>cycleHour(s.id,h)} disabled={!previsto}
+                            title={previsto?(info?`${state} — clicca per cambiare`:"Clicca per segnare"):"Non previsto dall'orario"}
+                            style={{width:40,height:30,borderRadius:"var(--border-radius-md)",cursor:previsto?"pointer":"default",opacity:previsto?1:0.35,
+                              border:info?`1px solid ${info.fg}44`:"0.5px solid var(--color-border-tertiary)",
+                              background:info?info.bg:"transparent",color:info?info.fg:"var(--color-text-tertiary)",fontSize:13,fontWeight:info?500:400}}>
+                            {previsto?(info?info.l:"·"):"–"}
                           </button>
-                          {giustBadge(s.id,h,state,giust,15)}
+                          {previsto && giustBadge(s.id,h,state,giustOf(s.id,h),15)}
                         </div>
                       </td>
                     );
                   })}
                 </tr>
-              ))}
+                );
+              })}
             </tbody>
           </table>
         </div>
         <div style={{fontSize:11,color:"var(--color-text-tertiary)",marginTop:8,paddingLeft:2}}>
-          La pallina <strong>G</strong> sulle assenze e sui ritardi indica se sono giustificati{isSegreteria?" — toccala per giustificare.":" (solo la segreteria può modificarli)."} Il pallino <strong>●</strong> accanto a un nome segnala chi è iscritto a più classi (le presenze sono condivise).
+          Le fasce con il trattino <strong>–</strong> non sono previste dall'orario dello studente. La pallina <strong>G</strong> segnala le giustificazioni{isSegreteria?" — cliccala per giustificare.":" (solo la segreteria può modificarle)."} Il pallino <strong>●</strong> indica chi è iscritto a più classi.
         </div>
       </div>
     );
@@ -625,8 +693,8 @@ function Registro({ ruolo, onLogout }) {
   const content = (
     <>
       {view==="reg" && registerView()}
-      {view==="stats" && cls && <StatsView cls={cls} clsStudents={clsStudents} date={date} />}
-      {view==="export" && isSegreteria && <ExportView classes={classes} students={students} iscrizioni={iscrizioni} />}
+      {view==="stats" && cls && <StatsView cls={cls} clsStudents={clsStudents} date={date} orari={orari} />}
+      {view==="export" && isSegreteria && <ExportView classes={classes} students={students} iscrizioni={iscrizioni} orari={orari} />}
       {view==="manage" && isSegreteria && (
         <div>
           <div style={{marginBottom:20}}>
@@ -645,8 +713,7 @@ function Registro({ ruolo, onLogout }) {
                   {editCls && editCls.id===c.id ? (
                     <>
                       <input value={editCls.nome} autoFocus onChange={e=>setEditCls({...editCls,nome:e.target.value})}
-                        onKeyDown={e=>{if(e.key==="Enter")renameCls(c.id,editCls.nome);if(e.key==="Escape")setEditCls(null);}}
-                        style={{...inp,flex:1}} />
+                        onKeyDown={e=>{if(e.key==="Enter")renameCls(c.id,editCls.nome);if(e.key==="Escape")setEditCls(null);}} style={{...inp,flex:1}} />
                       <button style={bBlue} onClick={()=>renameCls(c.id,editCls.nome)}>Salva</button>
                       <button style={b} onClick={()=>setEditCls(null)}>Annulla</button>
                     </>
@@ -683,21 +750,42 @@ function Registro({ ruolo, onLogout }) {
                 {clsStudents.map((s,i)=>{
                   const altre = classNamesOf(s.id).filter(n=>n!==cls.nome);
                   return (
-                  <div key={s.id} style={{display:"flex",alignItems:"center",padding:"9px 14px",borderTop:i>0?"0.5px solid var(--color-border-tertiary)":"none",gap:8}}>
-                    {editStu && editStu.id===s.id ? (
-                      <>
-                        <input value={editStu.nome} autoFocus onChange={e=>setEditStu({...editStu,nome:e.target.value})}
-                          onKeyDown={e=>{if(e.key==="Enter")renameStu(s.id,editStu.nome);if(e.key==="Escape")setEditStu(null);}}
-                          style={{...inp,flex:1}} />
-                        <button style={bBlue} onClick={()=>renameStu(s.id,editStu.nome)}>Salva</button>
-                        <button style={b} onClick={()=>setEditStu(null)}>Annulla</button>
-                      </>
-                    ) : (
-                      <>
-                        <span style={{flex:1,fontSize:14}}>{s.nome}{altre.length>0 && <span style={{fontSize:11,color:"var(--color-text-tertiary)",marginLeft:8}}>anche in {altre.join(", ")}</span>}</span>
-                        <button style={b} onClick={()=>setEditStu({id:s.id,nome:s.nome})}>Rinomina</button>
-                        <button style={{...b,color:"#A32D2D",borderColor:"#F09595"}} onClick={()=>remStu(s.id)} title={altre.length>0?"Toglie da questa classe":"Elimina lo studente"}>Rimuovi</button>
-                      </>
+                  <div key={s.id} style={{borderTop:i>0?"0.5px solid var(--color-border-tertiary)":"none"}}>
+                    <div style={{display:"flex",alignItems:"center",padding:"9px 14px",gap:8}}>
+                      {editStu && editStu.id===s.id ? (
+                        <>
+                          <input value={editStu.nome} autoFocus onChange={e=>setEditStu({...editStu,nome:e.target.value})}
+                            onKeyDown={e=>{if(e.key==="Enter")renameStu(s.id,editStu.nome);if(e.key==="Escape")setEditStu(null);}} style={{...inp,flex:1}} />
+                          <button style={bBlue} onClick={()=>renameStu(s.id,editStu.nome)}>Salva</button>
+                          <button style={b} onClick={()=>setEditStu(null)}>Annulla</button>
+                        </>
+                      ) : (
+                        <>
+                          <span style={{flex:1,fontSize:14}}>{s.nome}{altre.length>0 && <span style={{fontSize:11,color:"var(--color-text-tertiary)",marginLeft:8}}>anche in {altre.join(", ")}</span>}</span>
+                          <button style={openOrario===s.id?bBlue:b} onClick={()=>setOpenOrario(openOrario===s.id?null:s.id)}>Orario</button>
+                          <button style={b} onClick={()=>setEditStu({id:s.id,nome:s.nome})}>Rinomina</button>
+                          <button style={{...b,color:"#A32D2D",borderColor:"#F09595"}} onClick={()=>remStu(s.id)} title={altre.length>0?"Toglie da questa classe":"Elimina lo studente"}>Rimuovi</button>
+                        </>
+                      )}
+                    </div>
+                    {openOrario===s.id && (
+                      <div style={{padding:"10px 14px 14px",background:"var(--color-background-secondary)",borderTop:"0.5px solid var(--color-border-tertiary)"}}>
+                        <div style={{fontSize:12,color:"var(--color-text-secondary)",marginBottom:8}}>Ore di lezione previste per ogni giorno della settimana:</div>
+                        <div style={{display:"flex",gap:10,flexWrap:"wrap"}}>
+                          {GIORNI.map((g,idx)=>(
+                            <div key={g} style={{display:"flex",flexDirection:"column",alignItems:"center",gap:4}}>
+                              <span style={{fontSize:11,color:"var(--color-text-tertiary)"}}>{g}</span>
+                              <select value={oreOf(s.id, idx+1)} onChange={e=>setOrario(s.id, idx+1, Number(e.target.value))}
+                                style={{...inp,padding:"4px 6px",background:"var(--color-background-primary)"}}>
+                                {[0,1,2,3,4,5,6].map(n=><option key={n} value={n}>{n}</option>)}
+                              </select>
+                            </div>
+                          ))}
+                        </div>
+                        <div style={{fontSize:11,color:"var(--color-text-tertiary)",marginTop:8}}>
+                          Le ore si contano dalla prima fascia: 4 significa 8:30–12:30, 6 significa 8:30–14:30. Le modifiche si salvano subito.
+                        </div>
+                      </div>
                     )}
                   </div>
                   );
@@ -728,6 +816,7 @@ function Registro({ ruolo, onLogout }) {
 
       <div style={{display:"flex",alignItems:"center",gap:8,marginBottom:14,flexWrap:"wrap"}}>
         <input type="date" value={date} onChange={e=>setDate(e.target.value)} style={{...inp,width:"auto",fontSize:isMobile?15:13,padding:isMobile?"7px 10px":"5px 10px"}} />
+        <span style={{fontSize:12,color:"var(--color-text-tertiary)"}}>{nomeGiorno(date)}</span>
         <button style={view==="reg"?bBlue:b} onClick={()=>setView("reg")}>Registro</button>
         <button style={view==="stats"?bBlue:b} onClick={()=>setView("stats")}>Storico</button>
         {isSegreteria && <button style={view==="export"?bBlue:b} onClick={()=>setView("export")}>Esporta</button>}
@@ -735,9 +824,7 @@ function Registro({ ruolo, onLogout }) {
       </div>
 
       {notice && (
-        <div style={{marginBottom:12,padding:"9px 14px",background:"var(--color-background-secondary)",border:"0.5px solid var(--color-border-secondary)",borderRadius:"var(--border-radius-md)",fontSize:13,color:"var(--color-text-secondary)"}}>
-          {notice}
-        </div>
+        <div style={{marginBottom:12,padding:"9px 14px",background:"var(--color-background-secondary)",border:"0.5px solid var(--color-border-secondary)",borderRadius:"var(--border-radius-md)",fontSize:13,color:"var(--color-text-secondary)"}}>{notice}</div>
       )}
 
       {err && (
@@ -773,9 +860,9 @@ function Registro({ ruolo, onLogout }) {
   );
 }
 
-/* ---------- storico ---------- */
+/* ================= storico ================= */
 
-function StatsView({ cls, clsStudents, date }) {
+function StatsView({ cls, clsStudents, date, orari }) {
   const [stats, setStats] = useState(null);
   const [period, setPeriod] = useState("month");
   const [err, setErr] = useState(null);
@@ -791,39 +878,21 @@ function StatsView({ cls, clsStudents, date }) {
         let filter = "";
         if (period === "day") filter = `&data=eq.${date}`;
         else if (period === "month") { const r = monthRange(date.slice(0,7)); filter = `&data=gte.${r.start}&data=lt.${r.endExcl}`; }
-        else { filter = `&data=gte.${sy.start}&data=lt.${sy.endExcl}`; }
+        else filter = `&data=gte.${sy.start}&data=lt.${sy.endExcl}`;
         const p = await api(`presenze?select=studente_id,data,fascia,stato,giustificato&studente_id=in.(${idsKey})${filter}`);
         if (annullato) return;
-        const map = {};
-        clsStudents.forEach(s => { map[s.id] = { ...s, presente:0, assente:0, ritardo:0, giustificate:0, giorniAss:0, giorniGiust:0 }; });
-        const byDay = {};
-        (p||[]).forEach(r => {
-          if (!map[r.studente_id]) return;
-          map[r.studente_id][r.stato]++;
-          if (r.giustificato && (r.stato==='assente' || r.stato==='ritardo')) map[r.studente_id].giustificate++;
-          byDay[r.studente_id] = byDay[r.studente_id] || {};
-          (byDay[r.studente_id][r.data] = byDay[r.studente_id][r.data] || []).push(r);
-        });
-        Object.entries(byDay).forEach(([sid, days]) => {
-          Object.values(days).forEach(rows => {
-            const morningAbs = rows.filter(r => MORNING.includes(r.fascia) && r.stato==='assente');
-            if (morningAbs.length >= 4) {
-              map[sid].giorniAss++;
-              if (morningAbs.every(r => r.giustificato)) map[sid].giorniGiust++;
-            }
-          });
-        });
-        setStats(Object.values(map));
+        const perStu = {};
+        (p||[]).forEach(r => { (perStu[r.studente_id] = perStu[r.studente_id] || []).push(r); });
+        setStats(clsStudents.map(s => ({ ...s, ...analizza(perStu[s.id] || [], orari, s.id) })));
       } catch (e) { if (!annullato) setErr("Errore: " + (e.message||"")); }
     }
     load();
     return () => { annullato = true; };
-  }, [period, date, idsKey]);
+  }, [period, date, idsKey, orari]);
 
   const b = {fontSize:13,padding:"5px 12px",border:"0.5px solid var(--color-border-secondary)",borderRadius:"var(--border-radius-md)",background:"transparent",cursor:"pointer",color:"var(--color-text-primary)"};
   const bBlue = {...b,background:"#1F3864",color:"#fff",fontWeight:500,border:"0.5px solid #1F3864"};
   const th = {fontSize:11,color:"var(--color-text-secondary)",fontWeight:400,textTransform:"uppercase",letterSpacing:"0.04em",padding:"8px 12px"};
-
   const labels = { day:"Giorno selezionato", month:"Mese corrente", year:`Anno scolastico ${sy.label}` };
 
   return (
@@ -835,7 +904,7 @@ function StatsView({ cls, clsStudents, date }) {
         ))}
       </div>
       {err && <div style={{fontSize:13,color:"var(--color-text-danger)",marginBottom:10}}>{err}</div>}
-      <div style={{fontSize:13,color:"var(--color-text-secondary)",marginBottom:10}}>Ore totali per <strong>{cls.nome}</strong> — {labels[period].toLowerCase()}.</div>
+      <div style={{fontSize:13,color:"var(--color-text-secondary)",marginBottom:10}}>Totali per <strong>{cls.nome}</strong> — {labels[period].toLowerCase()}.</div>
       <div style={{background:"var(--color-background-primary)",border:"0.5px solid var(--color-border-tertiary)",borderRadius:"var(--border-radius-lg)",overflow:"auto"}}>
         <table style={{width:"100%",borderCollapse:"collapse",minWidth:560}}>
           <thead>
@@ -855,32 +924,34 @@ function StatsView({ cls, clsStudents, date }) {
             {stats && stats.map((s,i)=>(
               <tr key={s.id} style={{borderTop:i>0?"0.5px solid var(--color-border-tertiary)":"none"}}>
                 <td style={{padding:"8px 12px",fontSize:14}}>{s.nome}</td>
-                <td style={{textAlign:"center",fontSize:14,color:"#3B6D11",fontWeight:500}}>{s.presente}</td>
-                <td style={{textAlign:"center",fontSize:14,color:"#A32D2D",fontWeight:500}}>{s.assente}</td>
-                <td style={{textAlign:"center",fontSize:14,color:"#854F0B",fontWeight:500}}>{s.ritardo}</td>
-                <td style={{textAlign:"center",fontSize:14,color:"#3B6D11",fontWeight:500}}>{s.giustificate}</td>
-                <td style={{textAlign:"center",fontSize:14,color:"#A32D2D",fontWeight:500}}>{s.giorniAss}</td>
-                <td style={{textAlign:"center",fontSize:14,color:"#3B6D11",fontWeight:500}}>{s.giorniGiust}</td>
+                <td style={{textAlign:"center",fontSize:14,color:"#3B6D11",fontWeight:500}}>{s.pr}</td>
+                <td style={{textAlign:"center",fontSize:14,color:"#A32D2D",fontWeight:500}}>{s.as}</td>
+                <td style={{textAlign:"center",fontSize:14,color:"#854F0B",fontWeight:500}}>{s.ri}</td>
+                <td style={{textAlign:"center",fontSize:14,color:"#3B6D11",fontWeight:500}}>{s.gi}</td>
+                <td style={{textAlign:"center",fontSize:14,color:"#A32D2D",fontWeight:500}}>{s.gAss}</td>
+                <td style={{textAlign:"center",fontSize:14,color:"#3B6D11",fontWeight:500}}>{s.gGiust}</td>
               </tr>
             ))}
           </tbody>
         </table>
       </div>
       <div style={{fontSize:11,color:"var(--color-text-tertiary)",marginTop:8}}>
-        Un <strong>giorno di assenza</strong> è conteggiato quando lo studente risulta assente in tutte e quattro le fasce del mattino (8:30–12:30).
+        Un <strong>giorno di assenza</strong> è conteggiato quando lo studente risulta assente in tutte le ore previste dal suo orario per quel giorno.
       </div>
     </React.Fragment>
   );
 }
 
-/* ---------- esportazione ---------- */
+/* ================= esportazione e backup ================= */
 
-function ExportView({ classes, students, iscrizioni }) {
+function ExportView({ classes, students, iscrizioni, orari }) {
   const [clsId, setClsId] = useState(classes[0]?.id || "");
   const [stuId, setStuId] = useState("");
   const [month, setMonth] = useState(new Date().toISOString().slice(0,7));
   const [busy, setBusy] = useState(false);
+  const [bkBusy, setBkBusy] = useState(false);
   const [err, setErr] = useState(null);
+  const [msg, setMsg] = useState(null);
 
   const clsStudents = students.filter(s => iscrizioni.some(i => i.classe_id===clsId && i.studente_id===s.id));
 
@@ -892,30 +963,13 @@ function ExportView({ classes, students, iscrizioni }) {
   const studentObj = students.find(s=>s.id===stuId);
   const clsObj = classes.find(c=>c.id===clsId);
   const safeName = (studentObj?.nome || "studente").replace(/[^a-zA-Z0-9]+/g,"_");
+  const MESE_LBL = (() => { const [y,m] = month.split("-"); return `${MESI[parseInt(m,10)-1]||""} ${y}`; })();
 
   const fetchRows = async () => {
     const { start, endExcl } = monthRange(month);
     const p = await api(`presenze?select=data,fascia,stato,giustificato&studente_id=eq.${stuId}&data=gte.${start}&data=lt.${endExcl}&order=data,fascia`);
     return p || [];
   };
-
-  const totali = (rows) => {
-    let pr=0,as=0,ri=0,gi=0;
-    const byDay = {};
-    rows.forEach(r => {
-      if(r.stato==='presente')pr++; else if(r.stato==='assente')as++; else if(r.stato==='ritardo')ri++;
-      if(r.giustificato && (r.stato==='assente'||r.stato==='ritardo'))gi++;
-      (byDay[r.data] = byDay[r.data] || []).push(r);
-    });
-    let gAss=0, gGiust=0;
-    Object.values(byDay).forEach(rs => {
-      const ma = rs.filter(r => MORNING.includes(r.fascia) && r.stato==='assente');
-      if (ma.length >= 4) { gAss++; if (ma.every(r=>r.giustificato)) gGiust++; }
-    });
-    return { pr, as, ri, gi, gAss, gGiust };
-  };
-
-  const MESE_LBL = (() => { const [y,m] = month.split("-"); return `${MESI[parseInt(m,10)-1]||""} ${y}`; })();
 
   const openBlank = () => {
     const w = window.open("", "_blank");
@@ -933,12 +987,14 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Arial,sans-s
 .head img{height:54px;width:auto;}
 .h1{font-size:18px;font-weight:600;color:#1F3864;}
 .h2{font-size:13px;color:#2E75B5;}
-.meta{font-size:13px;margin-bottom:16px;line-height:1.8;}
+.meta{font-size:13px;margin-bottom:18px;line-height:1.8;}
 .meta b{color:#1F3864;}
+h3{font-size:13px;color:#1F3864;margin:22px 0 8px;text-transform:uppercase;letter-spacing:.04em;}
 table{border-collapse:collapse;width:100%;font-size:13px;}
 th{background:#1F3864;color:#fff;text-align:left;padding:7px 10px;font-weight:500;}
 td{padding:6px 10px;border-bottom:1px solid #dddddd;}
 tr:nth-child(even) td{background:#f3f6fb;}
+.vuoto{color:#888;font-size:12px;padding:6px 0;}
 .foot{margin-top:24px;font-size:11px;color:#888888;border-top:1px solid #dddddd;padding-top:8px;}
 </style></head><body>
 <div class="head"><img src="${location.origin}/logo.png" onerror="this.style.display='none'"/><div><div class="h1">Registro presenze</div><div class="h2">${titolo}</div></div></div>
@@ -948,16 +1004,25 @@ ${inner}
 <script>window.onload=function(){setTimeout(function(){window.print();},300);};<\/script>
 </body></html>`;
 
+  const sezioniHtml = (a) => {
+    const t1 = a.giorniAss.length
+      ? `<table><tr><th>Data</th><th>Giorno</th><th>Ore previste</th><th>Esito</th><th>Giustificata</th></tr>${
+          a.giorniAss.map(g=>`<tr><td>${itDate(g.data)}</td><td>${nomeGiorno(g.data)}</td><td>${g.ore}</td><td>Assente per l'intera giornata</td><td>${g.giustificato?"Sì":"No"}</td></tr>`).join("")}</table>`
+      : `<div class="vuoto">Nessun giorno di assenza completa nel mese.</div>`;
+    const t2 = a.oreParziali.length
+      ? `<table><tr><th>Data</th><th>Giorno</th><th>Fascia</th><th>Tipo</th><th>Giustificata</th></tr>${
+          a.oreParziali.map(r=>`<tr><td>${itDate(r.data)}</td><td>${nomeGiorno(r.data)}</td><td>${r.fascia}–${HOUR_END[r.fascia]||""}</td><td>${r.stato==='assente'?"Assenza":"Ritardo"}</td><td>${r.giustificato?"Sì":"No"}</td></tr>`).join("")}</table>`
+      : `<div class="vuoto">Nessuna ora di assenza o ritardo isolata nel mese.</div>`;
+    return `<h3>1 · Giorni di assenza</h3>${t1}<h3>2 · Ore di assenza e ritardo (giornate parziali)</h3>${t2}`;
+  };
+
   const pdfRiepilogo = async () => {
     if (!stuId) return;
     const w = openBlank(); if (!w) return;
     setErr(null); setBusy(true);
     try {
-      const t = totali(await fetchRows());
-      const inner = `<table>
-<tr><th>Ore presenti</th><th>Ore assenti</th><th>Ore ritardo</th><th>Ore giustificate</th><th>Giorni assenza</th><th>Giorni giustificati</th></tr>
-<tr><td>${t.pr}</td><td>${t.as}</td><td>${t.ri}</td><td>${t.gi}</td><td>${t.gAss}</td><td>${t.gGiust}</td></tr></table>`;
-      w.document.open(); w.document.write(reportHtml("Riepilogo mensile", inner)); w.document.close();
+      const a = analizza(await fetchRows(), orari, stuId);
+      w.document.open(); w.document.write(reportHtml("Riepilogo mensile", sezioniHtml(a))); w.document.close();
     } catch(e){ setErr("Errore: "+(e.message||"")); try{w.close();}catch(_){} } finally { setBusy(false); }
   };
 
@@ -968,9 +1033,9 @@ ${inner}
     try {
       const rows = await fetchRows();
       const body = rows.length
-        ? rows.map(r => `<tr><td>${r.data.split("-").reverse().join("/")}</td><td>${r.fascia}–${HOUR_END[r.fascia]||""}</td><td>${r.stato}</td><td>${r.giustificato?"Sì":"No"}</td></tr>`).join("")
-        : `<tr><td colspan="4" style="text-align:center;color:#888">Nessun dato registrato nel mese</td></tr>`;
-      const inner = `<table><tr><th>Data</th><th>Fascia</th><th>Stato</th><th>Giustificato</th></tr>${body}</table>`;
+        ? rows.map(r => `<tr><td>${itDate(r.data)}</td><td>${nomeGiorno(r.data)}</td><td>${r.fascia}–${HOUR_END[r.fascia]||""}</td><td>${r.stato}</td><td>${r.giustificato?"Sì":"No"}</td></tr>`).join("")
+        : `<tr><td colspan="5" style="text-align:center;color:#888">Nessun dato registrato nel mese</td></tr>`;
+      const inner = `<table><tr><th>Data</th><th>Giorno</th><th>Fascia</th><th>Stato</th><th>Giustificato</th></tr>${body}</table>`;
       w.document.open(); w.document.write(reportHtml("Dettaglio mensile", inner)); w.document.close();
     } catch(e){ setErr("Errore: "+(e.message||"")); try{w.close();}catch(_){} } finally { setBusy(false); }
   };
@@ -979,21 +1044,20 @@ ${inner}
     if (!stuId) return;
     setErr(null); setBusy(true);
     try {
-      const t = totali(await fetchRows());
-      const data = [{
-        Studente: studentObj?.nome || "",
-        Classe: clsObj?.nome || "",
-        Mese: month,
-        "Ore presenti": t.pr,
-        "Ore assenti": t.as,
-        "Ore ritardo": t.ri,
-        "Ore giustificate": t.gi,
-        "Giorni assenza": t.gAss,
-        "Giorni giustificati": t.gGiust,
-      }];
-      const ws = XLSX.utils.json_to_sheet(data);
+      const a = analizza(await fetchRows(), orari, stuId);
       const wb = XLSX.utils.book_new();
-      XLSX.utils.book_append_sheet(wb, ws, "Riepilogo");
+      const giorni = a.giorniAss.length
+        ? a.giorniAss.map(g=>({ Data: itDate(g.data), Giorno: nomeGiorno(g.data), "Ore previste": g.ore, Esito: "Assente per l'intera giornata", Giustificata: g.giustificato?"Sì":"No" }))
+        : [{ Data:"", Giorno:"", "Ore previste":"", Esito:"Nessun giorno di assenza completa", Giustificata:"" }];
+      const ore = a.oreParziali.length
+        ? a.oreParziali.map(r=>({ Data: itDate(r.data), Giorno: nomeGiorno(r.data), Fascia: `${r.fascia}–${HOUR_END[r.fascia]||""}`, Tipo: r.stato==='assente'?"Assenza":"Ritardo", Giustificata: r.giustificato?"Sì":"No" }))
+        : [{ Data:"", Giorno:"", Fascia:"", Tipo:"Nessuna ora isolata", Giustificata:"" }];
+      const tot = [{ Studente: studentObj?.nome||"", Classe: clsObj?.nome||"", Mese: MESE_LBL,
+        "Giorni di assenza": a.gAss, "di cui giustificati": a.gGiust,
+        "Ore assenza": a.as, "Ore ritardo": a.ri, "Ore giustificate": a.gi, "Ore presenza": a.pr }];
+      XLSX.utils.book_append_sheet(wb, XLSX.utils.json_to_sheet(giorni), "Giorni di assenza");
+      XLSX.utils.book_append_sheet(wb, XLSX.utils.json_to_sheet(ore), "Ore parziali");
+      XLSX.utils.book_append_sheet(wb, XLSX.utils.json_to_sheet(tot), "Totali");
       XLSX.writeFile(wb, `riepilogo_${safeName}_${month}.xlsx`);
     } catch(e){ setErr("Errore: "+(e.message||"")); } finally { setBusy(false); }
   };
@@ -1003,27 +1067,46 @@ ${inner}
     setErr(null); setBusy(true);
     try {
       const rows = await fetchRows();
-      const data = rows.map(r => ({
-        Data: r.data.split("-").reverse().join("/"),
-        Fascia: `${r.fascia}–${HOUR_END[r.fascia]||""}`,
-        Stato: r.stato,
-        Giustificato: r.giustificato ? "Sì" : "No",
-      }));
-      if (!data.length) data.push({ Data:"", Fascia:"", Stato:"Nessun dato nel mese", Giustificato:"" });
-      const ws = XLSX.utils.json_to_sheet(data);
+      const data = rows.map(r => ({ Data: itDate(r.data), Giorno: nomeGiorno(r.data), Fascia: `${r.fascia}–${HOUR_END[r.fascia]||""}`, Stato: r.stato, Giustificato: r.giustificato?"Sì":"No" }));
+      if (!data.length) data.push({ Data:"", Giorno:"", Fascia:"", Stato:"Nessun dato nel mese", Giustificato:"" });
       const wb = XLSX.utils.book_new();
-      XLSX.utils.book_append_sheet(wb, ws, "Dettaglio");
+      XLSX.utils.book_append_sheet(wb, XLSX.utils.json_to_sheet(data), "Dettaglio");
       XLSX.writeFile(wb, `dettaglio_${safeName}_${month}.xlsx`);
     } catch(e){ setErr("Errore: "+(e.message||"")); } finally { setBusy(false); }
   };
 
+  const backup = async () => {
+    setErr(null); setMsg(null); setBkBusy(true);
+    try {
+      const [cl, st, isc, or_] = await Promise.all([
+        fetchAllRows("classi?select=*&order=nome"),
+        fetchAllRows("studenti?select=*&order=nome"),
+        fetchAllRows("iscrizioni?select=*"),
+        fetchAllRows("orari?select=*"),
+      ]);
+      const pres = await fetchAllRows("presenze?select=*&order=data,studente_id,fascia");
+      const nomeStu = {}; st.forEach(s => { nomeStu[s.id] = s.nome; });
+      const nomeCls = {}; cl.forEach(c => { nomeCls[c.id] = c.nome; });
+      const wb = XLSX.utils.book_new();
+      XLSX.utils.book_append_sheet(wb, XLSX.utils.json_to_sheet(cl.map(c=>({ id:c.id, Nome:c.nome }))), "Classi");
+      XLSX.utils.book_append_sheet(wb, XLSX.utils.json_to_sheet(st.map(s=>({ id:s.id, Nome:s.nome }))), "Studenti");
+      XLSX.utils.book_append_sheet(wb, XLSX.utils.json_to_sheet(isc.map(i=>({ studente_id:i.studente_id, Studente:nomeStu[i.studente_id]||"", classe_id:i.classe_id, Classe:nomeCls[i.classe_id]||"" }))), "Iscrizioni");
+      XLSX.utils.book_append_sheet(wb, XLSX.utils.json_to_sheet(or_.map(o=>({ studente_id:o.studente_id, Studente:nomeStu[o.studente_id]||"", Giorno:GIORNI[o.giorno-1]||o.giorno, giorno_num:o.giorno, Ore:o.ore }))), "Orari");
+      XLSX.utils.book_append_sheet(wb, XLSX.utils.json_to_sheet(pres.map(p=>({ studente_id:p.studente_id, Studente:nomeStu[p.studente_id]||"", Data:p.data, Fascia:p.fascia, Stato:p.stato, Giustificato:p.giustificato?"Sì":"No" }))), "Presenze");
+      const oggi = new Date().toISOString().split("T")[0];
+      XLSX.writeFile(wb, `backup_registro_${oggi}.xlsx`);
+      setMsg(`Backup completato: ${pres.length} registrazioni, ${st.length} studenti. Conservalo in un posto sicuro (es. Drive).`);
+    } catch(e){ setErr("Errore nel backup: "+(e.message||"")); } finally { setBkBusy(false); }
+  };
+
   const lbl = {fontSize:12,color:"var(--color-text-tertiary)",textTransform:"uppercase",letterSpacing:"0.05em",marginBottom:6};
   const sel = {width:"100%",maxWidth:320,fontSize:14,padding:"8px 10px",borderRadius:"var(--border-radius-md)",border:"0.5px solid var(--color-border-secondary)",background:"var(--color-background-primary)",color:"var(--color-text-primary)"};
-  const dlBtn = {fontSize:14,padding:"9px 16px",borderRadius:"var(--border-radius-md)",cursor:stuId&&!busy?"pointer":"default",border:"none",background:stuId&&!busy?"#1F3864":"var(--color-background-secondary)",color:stuId&&!busy?"#fff":"var(--color-text-tertiary)",fontWeight:500};
-  const dlBtn2 = {fontSize:14,padding:"9px 16px",borderRadius:"var(--border-radius-md)",cursor:stuId&&!busy?"pointer":"default",border:"0.5px solid var(--color-border-secondary)",background:"transparent",color:stuId&&!busy?"var(--color-text-primary)":"var(--color-text-tertiary)",fontWeight:500};
+  const on = stuId && !busy;
+  const dlBtn = {fontSize:14,padding:"9px 16px",borderRadius:"var(--border-radius-md)",cursor:on?"pointer":"default",border:"none",background:on?"#1F3864":"var(--color-background-secondary)",color:on?"#fff":"var(--color-text-tertiary)",fontWeight:500};
+  const dlBtn2 = {fontSize:14,padding:"9px 16px",borderRadius:"var(--border-radius-md)",cursor:on?"pointer":"default",border:"0.5px solid var(--color-border-secondary)",background:"transparent",color:on?"var(--color-text-primary)":"var(--color-text-tertiary)",fontWeight:500};
 
   return (
-    <div style={{maxWidth:340}}>
+    <div style={{maxWidth:360}}>
       <div style={{fontSize:13,color:"var(--color-text-secondary)",marginBottom:16}}>Genera un archivio mensile per un singolo studente.</div>
 
       <div style={{marginBottom:14}}>
@@ -1051,18 +1134,30 @@ ${inner}
 
       <div style={{...lbl,marginTop:4}}>File Excel</div>
       <div style={{display:"flex",gap:10,flexWrap:"wrap",marginBottom:18}}>
-        <button style={dlBtn} disabled={!stuId||busy} onClick={doRiepilogo}>{busy?"Attendere…":"Riepilogo .xlsx"}</button>
-        <button style={dlBtn2} disabled={!stuId||busy} onClick={doDettaglio}>Dettaglio .xlsx</button>
+        <button style={dlBtn} disabled={!on} onClick={doRiepilogo}>{busy?"Attendere…":"Riepilogo .xlsx"}</button>
+        <button style={dlBtn2} disabled={!on} onClick={doDettaglio}>Dettaglio .xlsx</button>
       </div>
 
       <div style={lbl}>Report PDF</div>
       <div style={{display:"flex",gap:10,flexWrap:"wrap"}}>
-        <button style={dlBtn} disabled={!stuId||busy} onClick={pdfRiepilogo}>Riepilogo PDF</button>
-        <button style={dlBtn2} disabled={!stuId||busy} onClick={pdfDettaglio}>Dettaglio PDF</button>
+        <button style={dlBtn} disabled={!on} onClick={pdfRiepilogo}>Riepilogo PDF</button>
+        <button style={dlBtn2} disabled={!on} onClick={pdfDettaglio}>Dettaglio PDF</button>
       </div>
 
       <div style={{fontSize:11,color:"var(--color-text-tertiary)",marginTop:14}}>
-        Il <strong>riepilogo</strong> contiene i totali del mese, giorni di assenza compresi; il <strong>dettaglio</strong> elenca ogni singola fascia oraria registrata.
+        Il <strong>riepilogo</strong> elenca i giorni di assenza completa e, a parte, le ore di assenza o ritardo delle giornate parziali. Il <strong>dettaglio</strong> elenca ogni fascia oraria registrata, presenze comprese.
+      </div>
+
+      <div style={{marginTop:28,paddingTop:20,borderTop:"0.5px solid var(--color-border-tertiary)"}}>
+        <div style={lbl}>Backup completo</div>
+        <div style={{fontSize:13,color:"var(--color-text-secondary)",marginBottom:12}}>
+          Scarica una copia integrale dell'archivio (classi, studenti, iscrizioni, orari e tutte le presenze) in un unico file Excel. Consigliato una volta al mese.
+        </div>
+        <button onClick={backup} disabled={bkBusy}
+          style={{fontSize:14,padding:"9px 16px",borderRadius:"var(--border-radius-md)",cursor:bkBusy?"default":"pointer",border:"none",background:bkBusy?"var(--color-background-secondary)":"#1F3864",color:bkBusy?"var(--color-text-tertiary)":"#fff",fontWeight:500}}>
+          {bkBusy?"Backup in corso…":"Scarica backup completo"}
+        </button>
+        {msg && <div style={{fontSize:12,color:"var(--color-text-secondary)",marginTop:10,padding:"9px 12px",background:"var(--color-background-secondary)",borderRadius:"var(--border-radius-md)",border:"0.5px solid var(--color-border-secondary)"}}>{msg}</div>}
       </div>
     </div>
   );
