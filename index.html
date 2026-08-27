@@ -494,12 +494,33 @@ function Registro({ ruolo, onLogout }) {
     if (!isSegreteria) return;
     const existing = presKey(sid, h);
     if (!existing || !existing.stato) return;
+    const attiva = !existing.giustificato;
+
+    // Uscita anticipata: giustificando un'assenza, le ore successive previste
+    // dall'orario diventano assenze già giustificate. Non vale per i ritardi
+    // (che riguardano l'ingresso) né quando la giustificazione viene tolta.
+    let seguenti = [];
+    if (attiva && existing.stato === 'assente') {
+      const idx = HOURS.indexOf(h);
+      seguenti = fasceOggi(sid).fasce.filter(x => HOURS.indexOf(x) > idx);
+      if (seguenti.length) {
+        const gia = seguenti.filter(x => { const p = presKey(sid, x); return p && p.stato && !(p.stato === 'assente' && p.giustificato); });
+        const avviso = gia.length ? `\n\nAttenzione: ${gia.length === 1 ? "l'ora" : "le ore"} ${gia.join(", ")} risultano già compilate e verranno sovrascritte.` : "";
+        if (!window.confirm(`Uscita anticipata di ${(students.find(s=>s.id===sid)||{}).nome || "questo studente"}.\n\nSegnare come assenza giustificata anche le ore successive (${seguenti.join(", ")})?${avviso}`)) seguenti = [];
+      }
+    }
+
+    const righe = [
+      { studente_id: sid, data: date, fascia: h, stato: existing.stato, giustificato: attiva },
+      ...seguenti.map(x => ({ studente_id: sid, data: date, fascia: x, stato: 'assente', giustificato: true })),
+    ];
     try {
       const saved = await api("presenze?on_conflict=studente_id,data,fascia", {
         method: "POST", headers: WRITE_BACK,
-        body: JSON.stringify({ studente_id: sid, data: date, fascia: h, stato: existing.stato, giustificato: !existing.giustificato }),
+        body: JSON.stringify(righe.length === 1 ? righe[0] : righe),
       });
       mergeLocal(saved || []);
+      if (seguenti.length) say(`Uscita anticipata registrata: ${seguenti.length === 1 ? "un'ora successiva giustificata" : seguenti.length + " ore successive giustificate"}.`);
     } catch (e) { handleErr(e); loadPresenze(); }
   };
 
