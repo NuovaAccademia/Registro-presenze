@@ -54,6 +54,8 @@ const RUOLI = {
 const HOURS = ['08:30','09:30','10:30','11:30','12:30','13:30','14:30','15:30','16:30'];
 const HOUR_END = {'08:30':'09:30','09:30':'10:30','10:30':'11:30','11:30':'12:30','12:30':'13:30','13:30':'14:30','14:30':'15:30','15:30':'16:30','16:30':'17:30'};
 const MAX_POM = 3;
+// Quanti giorni passati un docente può ancora modificare (0 = solo oggi)
+const GIORNI_INDIETRO = 0;
 const GIORNI = ["Lun","Mar","Mer","Gio","Ven","Sab"];
 const MESI = ["gennaio","febbraio","marzo","aprile","maggio","giugno","luglio","agosto","settembre","ottobre","novembre","dicembre"];
 const CYCLE = [null,'presente','assente','ritardo'];
@@ -323,6 +325,7 @@ function Registro({ ruolo, onLogout }) {
   const [editCls, setEditCls] = useState(null);
   const [editStu, setEditStu] = useState(null);
   const [openOrario, setOpenOrario] = useState(null);
+  const [, setTick] = useState(0);
   const noticeTimer = useRef(null);
   const lastAct = useRef(Date.now());
 
@@ -382,6 +385,12 @@ function Registro({ ruolo, onLogout }) {
     return () => { window.removeEventListener("pointerdown", touch); window.removeEventListener("keydown", touch); };
   }, []);
 
+  // Ricalcola ogni minuto quali fasce sono ormai iniziate
+  useEffect(() => {
+    const t = setInterval(() => setTick(x => x + 1), 60000);
+    return () => clearInterval(t);
+  }, []);
+
   // Refresh solo nella vista Registro, a schermo visibile e con utente attivo
   useEffect(() => {
     if (view !== "reg") return;
@@ -410,13 +419,21 @@ function Registro({ ruolo, onLogout }) {
     return rec ? (rec.pom || 0) : 0;
   };
 
-  // Colonne da mostrare: sempre almeno le 6 del mattino, di più se qualcuno ha il pomeriggio
-  const lastIdx = clsStudents.reduce((mx, s) => {
-    const f = fasceOggi(s.id);
-    return Math.max(mx, f.p > 0 ? f.m + f.p : f.m - 1);
-  }, 5);
-  const visibleHours = HOURS.slice(0, Math.max(6, lastIdx + 1));
-  const wide = visibleHours.length > 6;
+  // Blocco orario: i docenti segnano solo il giorno corrente e solo le ore già iniziate
+  const oggiISO = new Date().toISOString().split("T")[0];
+  const giorniDaOggi = Math.round((new Date(date+"T00:00:00Z") - new Date(oggiISO+"T00:00:00Z")) / 86400000);
+  const oraIniziata = (h) => {
+    const [hh,mm] = h.split(":").map(Number);
+    const n = new Date();
+    return n.getHours()*60 + n.getMinutes() >= hh*60 + mm;
+  };
+  const motivoBlocco = (h) => {
+    if (isSegreteria) return null;
+    if (giorniDaOggi > 0) return "Non è possibile segnare presenze per una data futura.";
+    if (giorniDaOggi < -GIORNI_INDIETRO) return "I giorni già trascorsi possono essere corretti solo dalla segreteria.";
+    if (h && !oraIniziata(h)) return "Questa fascia oraria non è ancora iniziata.";
+    return null;
+  };
 
   const mergeLocal = (rows) => setPresenze(prev => {
     const map = new Map(prev.map(p => [p.studente_id + "|" + p.fascia, p]));
@@ -429,6 +446,8 @@ function Registro({ ruolo, onLogout }) {
       say("Questa fascia non è prevista dall'orario dello studente.");
       return;
     }
+    const bl = motivoBlocco(h);
+    if (bl) { say(bl); return; }
     const existing = presKey(sid, h);
     if (!isSegreteria && existing && existing.giustificato) {
       say("Ora giustificata dalla segreteria: solo la segreteria può modificarla.");
@@ -450,8 +469,12 @@ function Registro({ ruolo, onLogout }) {
   };
 
   const setAll = async (sid, status) => {
-    const fasce = fasceOggi(sid).fasce;
-    if (!fasce.length) { say("Nessuna ora prevista dall'orario per questo giorno."); return; }
+    const blGiorno = motivoBlocco(null);
+    if (blGiorno) { say(blGiorno); return; }
+    const tutte = fasceOggi(sid).fasce;
+    if (!tutte.length) { say("Nessuna ora prevista dall'orario per questo giorno."); return; }
+    const fasce = tutte.filter(h => !motivoBlocco(h));
+    if (!fasce.length) { say("Nessuna fascia oraria è ancora iniziata."); return; }
     try {
       const saved = await api("presenze?on_conflict=studente_id,data,fascia", {
         method: "POST", headers: WRITE_BACK,
@@ -626,11 +649,13 @@ function Registro({ ruolo, onLogout }) {
                   );
                   const state = stateOf(s.id,h);
                   const info = state ? ST[state] : null;
+                  const locked = !!motivoBlocco(h);
                   return (
                     <div key={h} style={{position:"relative"}}>
-                      <button onClick={()=>cycleHour(s.id,h)}
-                        style={{width:"100%",height:58,borderRadius:"var(--border-radius-md)",cursor:"pointer",display:"flex",flexDirection:"column",alignItems:"center",justifyContent:"center",gap:1,
-                          border:info?`1px solid ${info.fg}55`:"0.5px solid var(--color-border-tertiary)",
+                      <button onClick={()=>cycleHour(s.id,h)} disabled={locked}
+                        title={locked?motivoBlocco(h):""}
+                        style={{width:"100%",height:58,borderRadius:"var(--border-radius-md)",cursor:locked?"default":"pointer",display:"flex",flexDirection:"column",alignItems:"center",justifyContent:"center",gap:1,opacity:locked?0.5:1,
+                          border:info?`1px solid ${info.fg}55`:(locked?"0.5px dashed var(--color-border-secondary)":"0.5px solid var(--color-border-tertiary)"),
                           background:info?info.bg:"var(--color-background-secondary)",
                           color:info?info.fg:"var(--color-text-tertiary)"}}>
                         <span style={{fontSize:11,opacity:0.8}}>{h}<span style={{opacity:0.6}}>→{HOUR_END[h]}</span></span>
@@ -646,6 +671,7 @@ function Registro({ ruolo, onLogout }) {
           })}
           <div style={{fontSize:11,color:"var(--color-text-tertiary)",marginTop:4,paddingLeft:2}}>
             Le fasce con il trattino non sono previste dall'orario dello studente. La pallina <strong>G</strong> indica le giustificazioni{isSegreteria?" — toccala per giustificare.":"."}
+            {!isSegreteria && <span> Le celle tratteggiate non sono modificabili: puoi segnare solo le ore già iniziate della giornata di oggi.</span>}
           </div>
         </div>
       );
@@ -656,24 +682,24 @@ function Registro({ ruolo, onLogout }) {
         <div style={{background:"var(--color-background-primary)",border:"0.5px solid var(--color-border-tertiary)",borderRadius:"var(--border-radius-lg)",overflow:"hidden"}}>
           <table style={{width:"100%",borderCollapse:"collapse",tableLayout:"fixed"}}>
             <colgroup>
-              <col style={{width:wide?116:130}} />
-              <col style={{width:104}} />
-              {visibleHours.map(h=><col key={h} style={{width:wide?42:46}} />)}
+              <col style={{width:116}} />
+              <col style={{width:100}} />
+              {HOURS.map(h=><col key={h} style={{width:40}} />)}
             </colgroup>
             <thead>
               <tr style={{background:"var(--color-background-secondary)",borderBottom:"0.5px solid var(--color-border-tertiary)"}}>
                 <th style={{...th,textAlign:"left",padding:"8px 12px"}}>Studente</th>
                 <th style={th}>Tutta la giornata</th>
-                {visibleHours.map(h=>(
-                  <th key={h} style={th}>
+                {HOURS.map(h=>(
+                  <th key={h} style={{...th,padding:"8px 2px"}}>
                     <div>{h}</div>
-                    <div style={{fontSize:10,color:"var(--color-text-tertiary)",fontWeight:400}}>→{HOUR_END[h]}</div>
+                    <div style={{fontSize:9,color:"var(--color-text-tertiary)",fontWeight:400}}>→{HOUR_END[h]}</div>
                   </th>
                 ))}
               </tr>
             </thead>
             <tbody>
-              {clsStudents.length===0 && <tr><td colSpan={visibleHours.length+2} style={{padding:"20px 14px",fontSize:13,color:"var(--color-text-tertiary)"}}>Nessuno studente.{isSegreteria?" Aggiungili dalla sezione Gestione.":""}</td></tr>}
+              {clsStudents.length===0 && <tr><td colSpan={HOURS.length+2} style={{padding:"20px 14px",fontSize:13,color:"var(--color-text-tertiary)"}}>Nessuno studente.{isSegreteria?" Aggiungili dalla sezione Gestione.":""}</td></tr>}
               {clsStudents.map((s,i)=>{
                 const f = fasceOggi(s.id);
                 return (
@@ -693,24 +719,24 @@ function Registro({ ruolo, onLogout }) {
                       )}
                     </div>
                   </td>
-                  {visibleHours.map(h=>{
+                  {HOURS.map(h=>{
                     const isPausa = f.pausa === h;
                     const previsto = f.fasce.includes(h);
+                    const locked = previsto && !!motivoBlocco(h);
                     const state = stateOf(s.id,h);
                     const info = state ? ST[state] : null;
-                    const cw = wide?36:40;
                     if (isPausa) return (
-                      <td key={h} style={{textAlign:"center",padding:"4px 2px"}}>
-                        <span title="Pausa" style={{display:"inline-flex",alignItems:"center",justifyContent:"center",width:cw,height:30,borderRadius:"var(--border-radius-md)",border:"0.5px dashed var(--color-border-secondary)",fontSize:9,color:"var(--color-text-tertiary)"}}>pausa</span>
+                      <td key={h} style={{textAlign:"center",padding:"4px 1px"}}>
+                        <span title="Pausa" style={{display:"inline-flex",alignItems:"center",justifyContent:"center",width:36,height:30,borderRadius:"var(--border-radius-md)",border:"0.5px dashed var(--color-border-secondary)",fontSize:8,color:"var(--color-text-tertiary)"}}>pausa</span>
                       </td>
                     );
                     return (
-                      <td key={h} style={{textAlign:"center",padding:"4px 2px"}}>
+                      <td key={h} style={{textAlign:"center",padding:"4px 1px"}}>
                         <div style={{position:"relative",display:"inline-block"}}>
-                          <button onClick={()=>cycleHour(s.id,h)} disabled={!previsto}
-                            title={previsto?(info?`${state} — clicca per cambiare`:"Clicca per segnare"):"Non previsto dall'orario"}
-                            style={{width:cw,height:30,borderRadius:"var(--border-radius-md)",cursor:previsto?"pointer":"default",opacity:previsto?1:0.35,
-                              border:info?`1px solid ${info.fg}44`:"0.5px solid var(--color-border-tertiary)",
+                          <button onClick={()=>cycleHour(s.id,h)} disabled={!previsto||locked}
+                            title={!previsto?"Non previsto dall'orario":(locked?motivoBlocco(h):(info?`${state} — clicca per cambiare`:"Clicca per segnare"))}
+                            style={{width:36,height:30,borderRadius:"var(--border-radius-md)",cursor:(previsto&&!locked)?"pointer":"default",opacity:!previsto?0.3:(locked?0.5:1),
+                              border:info?`1px solid ${info.fg}44`:(locked?"0.5px dashed var(--color-border-secondary)":"0.5px solid var(--color-border-tertiary)"),
                               background:info?info.bg:"transparent",color:info?info.fg:"var(--color-text-tertiary)",fontSize:13,fontWeight:info?500:400}}>
                             {previsto?(info?info.l:"·"):"–"}
                           </button>
@@ -727,6 +753,7 @@ function Registro({ ruolo, onLogout }) {
         </div>
         <div style={{fontSize:11,color:"var(--color-text-tertiary)",marginTop:8,paddingLeft:2}}>
           Le fasce con il trattino <strong>–</strong> non sono previste dall'orario dello studente; <strong>pausa</strong> indica l'ora di stacco fra mattina e pomeriggio. La pallina <strong>G</strong> segnala le giustificazioni{isSegreteria?" — cliccala per giustificare.":" (solo la segreteria può modificarle)."} Il pallino <strong>●</strong> indica chi è iscritto a più classi.
+          {!isSegreteria && <span> Le celle tratteggiate non sono modificabili: puoi segnare solo le ore già iniziate della giornata di oggi.</span>}
         </div>
       </div>
     );
@@ -864,7 +891,7 @@ function Registro({ ruolo, onLogout }) {
   );
 
   return (
-    <div style={{fontFamily:"var(--font-sans)",color:"var(--color-text-primary)",maxWidth:720,margin:"0 auto",padding:"12px 16px"}}>
+    <div style={{fontFamily:"var(--font-sans)",color:"var(--color-text-primary)",maxWidth:isMobile?720:840,margin:"0 auto",padding:"12px 16px"}}>
       <div style={{display:"flex",alignItems:"center",gap:8,marginBottom:14,flexWrap:"wrap"}}>
         <img src="logo.png" alt="Logo" style={{height:isMobile?52:96,width:"auto",marginRight:4}} />
         <span style={{fontWeight:500,fontSize:isMobile?16:18,flex:1}}>Registro presenze</span>
