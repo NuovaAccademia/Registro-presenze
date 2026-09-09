@@ -69,9 +69,28 @@ const ST = {
   assente:  { bg:'#FCEBEB', fg:'#A32D2D', fbg:'#FDF5F5', ffg:'#CE8B8B', l:'A' },
   ritardo:  { bg:'#FAEEDA', fg:'#854F0B', fbg:'#FCF7EE', ffg:'#C2A272', l:'R' },
 };
-const PRES_COLS = "id,studente_id,fascia,stato,giustificato";
+const PRES_COLS = "id,studente_id,fascia,stato,giustificato,updated_at";
 const IDLE_MS = 15 * 60 * 1000;   // oltre questo tempo di inattività il refresh si sospende
 const POLL_MS = 25000;
+const FULL_EVERY_MS = 5 * 60 * 1000;  // ogni tanto una ricarica completa: le righe cancellate
+                                      // non lasciano traccia e sfuggirebbero al refresh incrementale
+const SCHOOL_START = 8 * 60;          // 08:00 — prima di quest'ora nessuno registra nulla
+const SCHOOL_END = 17 * 60 + 45;      // 17:45 — l'ultima fascia finisce alle 17:30
+
+// Colori assegnabili alle classi. La chiave (non il codice esadecimale) è ciò
+// che viene salvato in classi.colore, così la palette resta modificabile qui.
+const CLASS_COLORS = {
+  blu:      { nome: "Blu",      dot: "#2E75B5", bg: "#E7F0F9" },
+  verde:    { nome: "Verde",    dot: "#3B7D4F", bg: "#E6F2EA" },
+  ambra:    { nome: "Ambra",    dot: "#C2820A", bg: "#FBF1DC" },
+  rosso:    { nome: "Rosso",    dot: "#B4433A", bg: "#FAE9E7" },
+  viola:    { nome: "Viola",    dot: "#6B4E9B", bg: "#EFEAF7" },
+  turchese: { nome: "Turchese", dot: "#16808C", bg: "#E2F2F3" },
+  magenta:  { nome: "Magenta",  dot: "#A93B72", bg: "#F8E9F1" },
+  ardesia:  { nome: "Ardesia",  dot: "#5A6B7B", bg: "#ECEFF2" },
+};
+const COLOR_KEYS = Object.keys(CLASS_COLORS);
+const coloreDi = (c) => (c && CLASS_COLORS[c.colore]) || null;
 
 /* ================= comunicazione con Supabase ================= */
 
@@ -333,6 +352,8 @@ function Registro({ ruolo, onLogout }) {
   const [, setTick] = useState(0);
   const noticeTimer = useRef(null);
   const lastAct = useRef(Date.now());
+  const lastSync = useRef(null);   // marcatura dell'ultima riga vista, per il refresh incrementale
+  const lastFull = useRef(0);      // quando è avvenuta l'ultima lettura completa
 
   const say = useCallback((m) => {
     setNotice(m);
@@ -347,6 +368,7 @@ function Registro({ ruolo, onLogout }) {
   }, [say]);
 
   const cls = classes.find(c => c.id === selCls);
+  const colCls = coloreDi(cls);
   const clsStudentIds = iscrizioni.filter(i => i.classe_id === selCls).map(i => i.studente_id);
   const idsKey = clsStudentIds.join(",");
   const clsStudents = students.filter(s => clsStudentIds.includes(s.id));
@@ -369,18 +391,38 @@ function Registro({ ruolo, onLogout }) {
     } finally { setLoading(false); }
   }, []);
 
-  const loadPresenze = useCallback(async () => {
-    if (!idsKey) { setPresenze([]); return; }
+  // Caricamento delle presenze. In modalità incrementale chiede solo le righe
+  // toccate dopo l'ultimo controllo: quasi sempre nessuna, quindi risposta vuota.
+  // Le cancellazioni però non lasciano traccia, perciò ogni FULL_EVERY_MS si
+  // torna alla lettura completa, che è l'unica a poter accorgersi di una riga sparita.
+  const loadPresenze = useCallback(async (incrementale) => {
+    if (!idsKey) { setPresenze([]); lastSync.current = null; return; }
+    const inc = !!incrementale && !!lastSync.current && (Date.now() - lastFull.current < FULL_EVERY_MS);
     try {
-      const p = await api(`presenze?select=${PRES_COLS}&data=eq.${date}&studente_id=in.(${idsKey})`);
-      setPresenze(p || []); setErr(null);
+      const q = `presenze?select=${PRES_COLS}&data=eq.${date}&studente_id=in.(${idsKey})`
+        + (inc ? `&updated_at=gt.${encodeURIComponent(lastSync.current)}` : "");
+      const p = await api(q);
+      if (inc) {
+        if (p && p.length) setPresenze(prev => {
+          const map = new Map(prev.map(r => [r.studente_id + "|" + r.fascia, r]));
+          p.forEach(r => map.set(r.studente_id + "|" + r.fascia, r));
+          return Array.from(map.values());
+        });
+      } else {
+        setPresenze(p || []);
+        lastFull.current = Date.now();
+      }
+      (p || []).forEach(r => {
+        if (r.updated_at && (!lastSync.current || r.updated_at > lastSync.current)) lastSync.current = r.updated_at;
+      });
+      setErr(null);
     } catch (e) {
       setErr("Errore nel caricare le presenze: " + (e.message||""));
     }
   }, [date, idsKey]);
 
   useEffect(() => { loadAll(); }, [loadAll]);
-  useEffect(() => { loadPresenze(); }, [loadPresenze]);
+  useEffect(() => { lastSync.current = null; lastFull.current = 0; loadPresenze(false); }, [loadPresenze]);
 
   // Traccia l'attività per sospendere il refresh su dispositivi lasciati aperti
   useEffect(() => {
@@ -396,11 +438,21 @@ function Registro({ ruolo, onLogout }) {
     return () => clearInterval(t);
   }, []);
 
-  // Refresh solo nella vista Registro, a schermo visibile e con utente attivo
+  // Refresh solo nella vista Registro, a schermo visibile e con utente attivo.
+  // In più resta fermo nelle "finestre morte": quando la data mostrata non è
+  // oggi (nessuno la sta modificando in tempo reale), di domenica e fuori
+  // dall'orario scolastico. Il rientro sull'app forza comunque una lettura completa.
   useEffect(() => {
     if (view !== "reg") return;
-    const tick = () => { if (!document.hidden && Date.now() - lastAct.current < IDLE_MS) loadPresenze(); };
-    const onBack = () => { if (!document.hidden) { lastAct.current = Date.now(); loadPresenze(); } };
+    const finestraUtile = () => {
+      if (date !== new Date().toISOString().split("T")[0]) return false;
+      const ora = new Date();
+      if (ora.getDay() === 0) return false;
+      const m = ora.getHours()*60 + ora.getMinutes();
+      return m >= SCHOOL_START && m <= SCHOOL_END;
+    };
+    const tick = () => { if (!document.hidden && Date.now() - lastAct.current < IDLE_MS && finestraUtile()) loadPresenze(true); };
+    const onBack = () => { if (!document.hidden) { lastAct.current = Date.now(); loadPresenze(false); } };
     window.addEventListener("focus", onBack);
     document.addEventListener("visibilitychange", onBack);
     const t = setInterval(tick, POLL_MS);
@@ -613,6 +665,14 @@ function Registro({ ruolo, onLogout }) {
     catch (e) { handleErr(e); }
   };
 
+  const setColoreCls = async (id, colore) => {
+    if (!isSegreteria) return;
+    try {
+      await api(`classi?id=eq.${id}`, { method: "PATCH", headers:{Prefer:"return=minimal"}, body: JSON.stringify({ colore }) });
+      setClasses(prev => prev.map(c => c.id===id ? { ...c, colore } : c));
+    } catch (e) { handleErr(e); }
+  };
+
   const renameStu = async (id, nome) => {
     const n = (nome||"").trim(); if (!n) return;
     try { await api(`studenti?id=eq.${id}`, { method: "PATCH", headers:{Prefer:"return=minimal"}, body: JSON.stringify({ nome:n }) }); setEditStu(null); loadAll(); }
@@ -708,6 +768,7 @@ function Registro({ ruolo, onLogout }) {
     return (
       <div>
         <div style={{background:"var(--color-background-primary)",border:"0.5px solid var(--color-border-tertiary)",borderRadius:"var(--border-radius-lg)",overflow:"hidden"}}>
+          {colCls && <div style={{height:4,background:colCls.dot}} />}
           <table style={{width:"100%",borderCollapse:"collapse",tableLayout:"fixed"}}>
             <colgroup>
               <col style={{width:116}} />
@@ -715,7 +776,7 @@ function Registro({ ruolo, onLogout }) {
               {HOURS.map(h=><col key={h} style={{width:40}} />)}
             </colgroup>
             <thead>
-              <tr style={{background:"var(--color-background-secondary)",borderBottom:"0.5px solid var(--color-border-tertiary)"}}>
+              <tr style={{background:colCls?colCls.bg:"var(--color-background-secondary)",borderBottom:`0.5px solid ${colCls?colCls.dot+"44":"var(--color-border-tertiary)"}`}}>
                 <th style={{...th,textAlign:"left",padding:"8px 12px"}}>Studente</th>
                 {isSegreteria && <th style={th}>Tutta la giornata</th>}
                 {HOURS.map(h=>(
@@ -810,7 +871,7 @@ function Registro({ ruolo, onLogout }) {
             <div style={{background:"var(--color-background-primary)",border:"0.5px solid var(--color-border-tertiary)",borderRadius:"var(--border-radius-lg)",overflow:"hidden"}}>
               {classes.length===0&&<div style={{padding:"12px 14px",fontSize:13,color:"var(--color-text-tertiary)"}}>Nessuna classe.</div>}
               {classes.map((c,i)=>(
-                <div key={c.id} style={{display:"flex",alignItems:"center",padding:"9px 14px",borderTop:i>0?"0.5px solid var(--color-border-tertiary)":"none",gap:8}}>
+                <div key={c.id} style={{display:"flex",alignItems:"center",flexWrap:"wrap",padding:"9px 14px",borderTop:i>0?"0.5px solid var(--color-border-tertiary)":"none",gap:8}}>
                   {editCls && editCls.id===c.id ? (
                     <>
                       <input value={editCls.nome} autoFocus onChange={e=>setEditCls({...editCls,nome:e.target.value})}
@@ -820,7 +881,17 @@ function Registro({ ruolo, onLogout }) {
                     </>
                   ) : (
                     <>
-                      <span style={{flex:1,fontSize:14}}>{c.nome}</span>
+                      <span style={{flex:1,fontSize:14,display:"flex",alignItems:"center",gap:7}}>
+                        <span style={{width:10,height:10,borderRadius:"50%",flexShrink:0,background:coloreDi(c)?.dot || "transparent",border:coloreDi(c)?"none":"1px solid var(--color-border-secondary)"}} />
+                        {c.nome}
+                      </span>
+                      <span style={{display:"flex",gap:3,alignItems:"center"}}>
+                        {COLOR_KEYS.map(k=>(
+                          <button key={k} onClick={()=>setColoreCls(c.id, c.colore===k?null:k)} title={CLASS_COLORS[k].nome}
+                            style={{width:15,height:15,padding:0,borderRadius:"50%",cursor:"pointer",background:CLASS_COLORS[k].dot,
+                              border:c.colore===k?"2px solid var(--color-text-primary)":"1px solid #ffffff88"}} />
+                        ))}
+                      </span>
                       <span style={{fontSize:12,color:"var(--color-text-tertiary)"}}>{iscrizioni.filter(x=>x.classe_id===c.id).length} studenti</span>
                       <button style={b} onClick={()=>setEditCls({id:c.id,nome:c.nome})}>Rinomina</button>
                       <button style={{...b,color:"#A32D2D",borderColor:"#F09595"}} onClick={()=>remCls(c.id)}>Rimuovi</button>
@@ -959,7 +1030,7 @@ function Registro({ ruolo, onLogout }) {
       ) : isMobile ? (
         <div>
           <select value={selCls||""} onChange={e=>setSelCls(e.target.value)}
-            style={{width:"100%",fontSize:15,padding:"10px 12px",marginBottom:14,borderRadius:"var(--border-radius-md)",border:"0.5px solid var(--color-border-secondary)",background:"var(--color-background-primary)",color:"var(--color-text-primary)"}}>
+            style={{width:"100%",fontSize:15,padding:"10px 12px",marginBottom:14,borderRadius:"var(--border-radius-md)",border:"0.5px solid var(--color-border-secondary)",borderLeft:`5px solid ${coloreDi(classes.find(c=>c.id===selCls))?.dot || "var(--color-border-secondary)"}`,background:coloreDi(classes.find(c=>c.id===selCls))?.bg || "var(--color-background-primary)",color:"var(--color-text-primary)"}}>
             {classes.length===0 && <option>Nessuna classe</option>}
             {classes.map(c=><option key={c.id} value={c.id}>{c.nome}</option>)}
           </select>
@@ -970,9 +1041,15 @@ function Registro({ ruolo, onLogout }) {
           <div style={{width:148,flexShrink:0}}>
             <div style={{fontSize:11,color:"var(--color-text-tertiary)",textTransform:"uppercase",letterSpacing:"0.05em",marginBottom:6}}>Classi</div>
             {classes.length===0 && <div style={{fontSize:12,color:"var(--color-text-tertiary)"}}>Nessuna classe.{isSegreteria?" Creane una in Gestione.":""}</div>}
-            {classes.map(c=>(
-              <button key={c.id} onClick={()=>setSelCls(c.id)} style={{display:"block",width:"100%",textAlign:"left",padding:"7px 10px",borderRadius:"var(--border-radius-md)",cursor:"pointer",fontSize:13,fontWeight:selCls===c.id?500:400,background:selCls===c.id?"var(--color-background-secondary)":"transparent",border:selCls===c.id?"0.5px solid var(--color-border-secondary)":"0.5px solid transparent",color:"var(--color-text-primary)",marginBottom:3}}>{c.nome}</button>
-            ))}
+            {classes.map(c=>{
+              const col = coloreDi(c);
+              return (
+              <button key={c.id} onClick={()=>setSelCls(c.id)} style={{display:"flex",alignItems:"center",gap:7,width:"100%",textAlign:"left",padding:"7px 10px",borderRadius:"var(--border-radius-md)",cursor:"pointer",fontSize:13,fontWeight:selCls===c.id?500:400,background:selCls===c.id?(col?col.bg:"var(--color-background-secondary)"):"transparent",border:selCls===c.id?`0.5px solid ${col?col.dot+"66":"var(--color-border-secondary)"}`:"0.5px solid transparent",color:"var(--color-text-primary)",marginBottom:3}}>
+                <span style={{width:9,height:9,borderRadius:"50%",flexShrink:0,background:col?col.dot:"transparent",border:col?"none":"1px solid var(--color-border-secondary)"}} />
+                <span style={{flex:1,minWidth:0,overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}}>{c.nome}</span>
+              </button>
+              );
+            })}
           </div>
           <div style={{flex:1,minWidth:0,overflowX:"auto"}}>{content}</div>
         </div>
