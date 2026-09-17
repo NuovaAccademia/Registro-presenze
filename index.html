@@ -349,11 +349,13 @@ function Registro({ ruolo, onLogout }) {
   const [editCls, setEditCls] = useState(null);
   const [editStu, setEditStu] = useState(null);
   const [openOrario, setOpenOrario] = useState(null);
+  const [salvato, setSalvato] = useState({});   // riscontri "salvato" temporanei, per studente e giorno
   const [, setTick] = useState(0);
   const noticeTimer = useRef(null);
   const lastAct = useRef(Date.now());
   const lastSync = useRef(null);   // marcatura dell'ultima riga vista, per il refresh incrementale
   const lastFull = useRef(0);      // quando è avvenuta l'ultima lettura completa
+  const salvatoTimer = useRef({});
 
   const say = useCallback((m) => {
     setNotice(m);
@@ -476,7 +478,19 @@ function Registro({ ruolo, onLogout }) {
     return rec ? (rec.pom || 0) : 0;
   };
 
-  // Blocco orario: i docenti segnano solo il giorno corrente e solo le ore non ancora concluse
+  // Orario predefinito: 6 ore dal lunedì al venerdì, sabato libero, nessun pomeriggio.
+  // Il confronto è sui valori effettivi, non sull'esistenza del record: uno studente
+  // con un record salvato identico al predefinito non risulta personalizzato.
+  const orarioPersonalizzato = (sid) => {
+    for (let g = 1; g <= 6; g++) {
+      if (oreOf(sid, g) !== (g === 6 ? 0 : 6)) return true;
+      if (pomOf(sid, g) !== 0) return true;
+    }
+    return false;
+  };
+  const giornoPersonalizzato = (sid, g) => oreOf(sid, g) !== (g === 6 ? 0 : 6) || pomOf(sid, g) !== 0;
+
+
   const oggiISO = new Date().toISOString().split("T")[0];
   const giorniDaOggi = Math.round((new Date(date+"T00:00:00Z") - new Date(oggiISO+"T00:00:00Z")) / 86400000);
   const motivoBlocco = (h) => {
@@ -602,6 +616,14 @@ function Registro({ ruolo, onLogout }) {
         method: "POST", headers: WRITE,
         body: JSON.stringify({ studente_id: sid, giorno, ore, pom: p }),
       });
+      // La spunta compare solo a scrittura riuscita: è la conferma che il dato
+      // è arrivato al server, non il semplice riflesso del clic.
+      const chiave = sid + "|" + giorno;
+      setSalvato(prev => ({ ...prev, [chiave]: Date.now() }));
+      if (salvatoTimer.current[chiave]) clearTimeout(salvatoTimer.current[chiave]);
+      salvatoTimer.current[chiave] = setTimeout(() => {
+        setSalvato(prev => { const n = { ...prev }; delete n[chiave]; return n; });
+      }, 2500);
     } catch (e) { handleErr(e); loadAll(); }
   };
 
@@ -934,7 +956,11 @@ function Registro({ ruolo, onLogout }) {
                       ) : (
                         <>
                           <span style={{flex:1,fontSize:14}}>{s.nome}{altre.length>0 && <span style={{fontSize:11,color:"var(--color-text-tertiary)",marginLeft:8}}>anche in {altre.join(", ")}</span>}</span>
-                          <button style={openOrario===s.id?bBlue:b} onClick={()=>setOpenOrario(openOrario===s.id?null:s.id)}>Orario</button>
+                          <button style={openOrario===s.id?bBlue:(orarioPersonalizzato(s.id)?{...b,background:"#FAEEDA",borderColor:"#EF9F27",color:"#854F0B",fontWeight:500}:b)}
+                            title={orarioPersonalizzato(s.id)?"Orario personalizzato, diverso dal predefinito":"Orario predefinito: 6 ore dal lunedì al venerdì"}
+                            onClick={()=>setOpenOrario(openOrario===s.id?null:s.id)}>
+                            {orarioPersonalizzato(s.id) && <span style={{marginRight:5}}>●</span>}Orario
+                          </button>
                           <button style={b} onClick={()=>setEditStu({id:s.id,nome:s.nome})}>Rinomina</button>
                           <button style={{...b,color:"#A32D2D",borderColor:"#F09595"}} onClick={()=>remStu(s.id)} title={altre.length>0?"Toglie da questa classe":"Elimina lo studente"}>Rimuovi</button>
                         </>
@@ -953,7 +979,7 @@ function Registro({ ruolo, onLogout }) {
                             const fine = m>0 ? (p>0 ? HOUR_END[HOURS[m+p]] : HOUR_END[HOURS[m-1]]) : null;
                             return (
                             <div key={g} style={{display:"flex",flexDirection:"column",alignItems:"center",gap:4,minWidth:54}}>
-                              <span style={{fontSize:11,color:"var(--color-text-tertiary)"}}>{g}</span>
+                              <span style={{fontSize:11,fontWeight:giornoPersonalizzato(s.id,gio)?600:400,color:giornoPersonalizzato(s.id,gio)?"#854F0B":"var(--color-text-tertiary)"}}>{g}</span>
                               <select value={m} onChange={e=>setOrario(s.id, gio, Number(e.target.value), p)}
                                 style={{...inp,padding:"4px 6px",background:"var(--color-background-primary)",width:52}}>
                                 {[0,1,2,3,4,5,6].map(n=><option key={n} value={n}>{n}</option>)}
@@ -969,13 +995,15 @@ function Registro({ ruolo, onLogout }) {
                                   title={mp===0?"Non c'è spazio per il pomeriggio":"Aggiungi ore pomeridiane"}
                                   style={{...inp,padding:"4px 6px",width:52,cursor:mp===0?"default":"pointer",opacity:mp===0?0.4:1,color:"var(--color-text-tertiary)"}}>+</button>
                               )}
-                              {fine && <span style={{fontSize:9,color:"var(--color-text-tertiary)"}}>fino {fine}</span>}
+                              {salvato[s.id+"|"+gio]
+                                ? <span style={{fontSize:9,color:"#3B6D11",fontWeight:600}}>✓ salvato</span>
+                                : (fine && <span style={{fontSize:9,color:"var(--color-text-tertiary)"}}>fino {fine}</span>)}
                             </div>
                             );
                           })}
                         </div>
                         <div style={{fontSize:11,color:"var(--color-text-tertiary)",marginTop:10}}>
-                          Il primo selettore indica le ore del mattino a partire dalle 8:30 (5 = fino alle 13:30). Con <strong>+</strong> aggiungi le ore pomeridiane, che iniziano dopo <strong>un'ora di pausa</strong>: 5 ore + 2 pomeridiane significa 8:30–13:30, pausa, poi 14:30–16:30. Le modifiche si salvano subito.
+                          Il primo selettore indica le ore del mattino a partire dalle 8:30 (5 = fino alle 13:30). Con <strong>+</strong> aggiungi le ore pomeridiane, che iniziano dopo <strong>un'ora di pausa</strong>: 5 ore + 2 pomeridiane significa 8:30–13:30, pausa, poi 14:30–16:30. Impostando <strong>0</strong> lo studente non ha lezione quel giorno e nel registro le caselle risultano non cliccabili. Le modifiche si salvano subito: la spunta <strong style={{color:"#3B6D11"}}>✓</strong> conferma che il dato è arrivato al server, e i giorni <strong style={{color:"#854F0B"}}>evidenziati</strong> sono quelli diversi dall'orario predefinito.
                         </div>
                       </div>
                     )}
