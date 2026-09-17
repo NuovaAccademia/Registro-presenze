@@ -53,7 +53,8 @@ const RUOLI = {
 
 const HOURS = ['08:30','09:30','10:30','11:30','12:30','13:30','14:30','15:30','16:30'];
 const HOUR_END = {'08:30':'09:30','09:30':'10:30','10:30':'11:30','11:30':'12:30','12:30':'13:30','13:30':'14:30','14:30':'15:30','15:30':'16:30','16:30':'17:30'};
-const MAX_POM = 3;
+const MAX_ORE = 6;   // durata massima del blocco principale
+const MAX_POM = 4;   // durata massima della coda pomeridiana (4 ore + pausa dopo 4 di mattina)
 // Quanti giorni passati un docente può ancora modificare (0 = solo oggi)
 const GIORNI_INDIETRO = 0;
 // Quante ore già concluse un docente può ancora modificare (0 = solo l'ora in corso)
@@ -202,27 +203,34 @@ function nomeGiorno(dateStr) {
 }
 function itDate(d) { return d.split("-").reverse().join("/"); }
 
-// Fasce previste da orario: mattina, un'ora di pausa, poi eventuale pomeriggio.
-// Se non impostato: 6 ore da lunedì a venerdì, sabato libero, nessun pomeriggio.
+// Fasce previste da orario: si parte dalla fascia "inizio", si contano le ore
+// del blocco principale, poi un'eventuale ora di pausa e la coda pomeridiana.
+// Se non impostato: inizio alle 8:30, 6 ore da lunedì a venerdì, sabato libero.
 function fasceGiorno(orari, sid, dateStr) {
   const w = weekdayOf(dateStr);
-  if (w === 0) return { mattina: [], pausa: null, pomeriggio: [], fasce: [], m: 0, p: 0 };
+  if (w === 0) return { mattina: [], pausa: null, pomeriggio: [], fasce: [], m: 0, p: 0, ini: 0 };
   const rec = orari.find(o => o.studente_id === sid && o.giorno === w);
   const m = rec ? rec.ore : (w === 6 ? 0 : 6);
   const p = rec ? (rec.pom || 0) : 0;
-  const mattina = HOURS.slice(0, m);
+  const ini = rec ? (rec.inizio || 0) : 0;
+  const mattina = HOURS.slice(ini, ini + m);
   let pausa = null, pomeriggio = [];
   if (m > 0 && p > 0) {
-    pausa = HOURS[m] || null;
-    pomeriggio = HOURS.slice(m + 1, m + 1 + p);
+    pausa = HOURS[ini + m] || null;
+    pomeriggio = HOURS.slice(ini + m + 1, ini + m + 1 + p);
   }
-  return { mattina, pausa, pomeriggio, fasce: [...mattina, ...pomeriggio], m, p };
+  return { mattina, pausa, pomeriggio, fasce: [...mattina, ...pomeriggio], m, p, ini };
+}
+
+// Quante ore può durare il blocco principale partendo dalla fascia "ini"
+function maxOre(ini) {
+  return Math.max(0, Math.min(MAX_ORE, HOURS.length - ini));
 }
 
 // Quante ore pomeridiane stanno ancora nella giornata (ultima fascia entro le 17:30)
-function maxPom(m) {
+function maxPom(m, ini) {
   if (m <= 0) return 0;
-  return Math.max(0, Math.min(MAX_POM, HOURS.length - m - 1));
+  return Math.max(0, Math.min(MAX_POM, HOURS.length - (ini || 0) - m - 1));
 }
 
 // Calcola giorni di assenza e ore, rispettando l'orario di ciascuno
@@ -478,17 +486,21 @@ function Registro({ ruolo, onLogout }) {
     return rec ? (rec.pom || 0) : 0;
   };
 
-  // Orario predefinito: 6 ore dal lunedì al venerdì, sabato libero, nessun pomeriggio.
-  // Il confronto è sui valori effettivi, non sull'esistenza del record: uno studente
-  // con un record salvato identico al predefinito non risulta personalizzato.
+  const iniOf = (sid, giorno) => {
+    const rec = orari.find(o => o.studente_id === sid && o.giorno === giorno);
+    return rec ? (rec.inizio || 0) : 0;
+  };
+
+  // Orario predefinito: inizio alle 8:30, 6 ore dal lunedì al venerdì,
+  // sabato libero, nessun pomeriggio. Il confronto è sui valori effettivi,
+  // non sull'esistenza del record: uno studente con un record salvato
+  // identico al predefinito non risulta personalizzato.
   const orarioPersonalizzato = (sid) => {
-    for (let g = 1; g <= 6; g++) {
-      if (oreOf(sid, g) !== (g === 6 ? 0 : 6)) return true;
-      if (pomOf(sid, g) !== 0) return true;
-    }
+    for (let g = 1; g <= 6; g++) if (giornoPersonalizzato(sid, g)) return true;
     return false;
   };
-  const giornoPersonalizzato = (sid, g) => oreOf(sid, g) !== (g === 6 ? 0 : 6) || pomOf(sid, g) !== 0;
+  const giornoPersonalizzato = (sid, g) =>
+    oreOf(sid, g) !== (g === 6 ? 0 : 6) || pomOf(sid, g) !== 0 || iniOf(sid, g) !== 0;
 
 
   const oggiISO = new Date().toISOString().split("T")[0];
@@ -605,16 +617,20 @@ function Registro({ ruolo, onLogout }) {
     } catch (e) { handleErr(e); loadPresenze(); }
   };
 
-  const setOrario = async (sid, giorno, ore, pom) => {
-    const p = Math.min(pom, maxPom(ore));
+  const setOrario = async (sid, giorno, ore, pom, inizio) => {
+    // I tre valori si vincolano a vicenda: spostando l'inizio in avanti si
+    // riduce lo spazio disponibile, quindi ore e pomeriggio vengono ridimensionati.
+    const i = Math.max(0, Math.min(inizio === undefined ? iniOf(sid, giorno) : inizio, HOURS.length - 1));
+    const o = Math.min(ore, maxOre(i));
+    const p = Math.min(pom, maxPom(o, i));
     setOrari(prev => {
-      const others = prev.filter(o => !(o.studente_id===sid && o.giorno===giorno));
-      return [...others, { studente_id: sid, giorno, ore, pom: p }];
+      const others = prev.filter(o2 => !(o2.studente_id===sid && o2.giorno===giorno));
+      return [...others, { studente_id: sid, giorno, ore: o, pom: p, inizio: i }];
     });
     try {
       await api("orari?on_conflict=studente_id,giorno", {
         method: "POST", headers: WRITE,
-        body: JSON.stringify({ studente_id: sid, giorno, ore, pom: p }),
+        body: JSON.stringify({ studente_id: sid, giorno, ore: o, pom: p, inizio: i }),
       });
       // La spunta compare solo a scrittura riuscita: è la conferma che il dato
       // è arrivato al server, non il semplice riflesso del clic.
@@ -968,32 +984,42 @@ function Registro({ ruolo, onLogout }) {
                     </div>
                     {openOrario===s.id && (
                       <div style={{padding:"10px 14px 14px",background:"var(--color-background-secondary)",borderTop:"0.5px solid var(--color-border-tertiary)"}}>
-                        <div style={{fontSize:12,color:"var(--color-text-secondary)",marginBottom:8}}>Ore di lezione previste per ogni giorno della settimana:</div>
+                        <div style={{fontSize:12,color:"var(--color-text-secondary)",marginBottom:8}}>Ingresso, ore consecutive ed eventuale coda pomeridiana, per ogni giorno della settimana:</div>
                         <div style={{display:"flex",gap:12,flexWrap:"wrap"}}>
                           {GIORNI.map((g,idx)=>{
                             const gio = idx+1;
                             const m = oreOf(s.id, gio);
                             const p = pomOf(s.id, gio);
-                            const mp = maxPom(m);
+                            const ini = iniOf(s.id, gio);
+                            const mp = maxPom(m, ini);
+                            const mo = maxOre(ini);
                             const f = { m, p };
-                            const fine = m>0 ? (p>0 ? HOUR_END[HOURS[m+p]] : HOUR_END[HOURS[m-1]]) : null;
+                            const fine = m>0 ? (p>0 ? HOUR_END[HOURS[ini+m+p]] : HOUR_END[HOURS[ini+m-1]]) : null;
                             return (
-                            <div key={g} style={{display:"flex",flexDirection:"column",alignItems:"center",gap:4,minWidth:54}}>
+                            <div key={g} style={{display:"flex",flexDirection:"column",alignItems:"center",gap:4,minWidth:62}}>
                               <span style={{fontSize:11,fontWeight:giornoPersonalizzato(s.id,gio)?600:400,color:giornoPersonalizzato(s.id,gio)?"#854F0B":"var(--color-text-tertiary)"}}>{g}</span>
-                              <select value={m} onChange={e=>setOrario(s.id, gio, Number(e.target.value), p)}
-                                style={{...inp,padding:"4px 6px",background:"var(--color-background-primary)",width:52}}>
-                                {[0,1,2,3,4,5,6].map(n=><option key={n} value={n}>{n}</option>)}
+                              <select value={ini} onChange={e=>setOrario(s.id, gio, m, p, Number(e.target.value))}
+                                title="Ora di ingresso" disabled={m===0}
+                                style={{...inp,padding:"4px 4px",width:62,fontSize:11,opacity:m===0?0.4:1,
+                                  background:ini>0?"#E7F0F9":"var(--color-background-primary)",
+                                  borderColor:ini>0?"#2E75B5":"var(--color-border-secondary)",color:ini>0?"#1F3864":"var(--color-text-primary)"}}>
+                                {HOURS.map((h,k)=><option key={h} value={k}>{h}</option>)}
+                              </select>
+                              <select value={m} onChange={e=>setOrario(s.id, gio, Number(e.target.value), p, ini)}
+                                title="Ore di lezione consecutive"
+                                style={{...inp,padding:"4px 6px",background:"var(--color-background-primary)",width:62}}>
+                                {Array.from({length:mo+1},(_,n)=>n).map(n=><option key={n} value={n}>{n}</option>)}
                               </select>
                               {p>0 ? (
-                                <select value={p} onChange={e=>setOrario(s.id, gio, m, Number(e.target.value))}
-                                  style={{...inp,padding:"4px 6px",background:"#FAEEDA",borderColor:"#EF9F27",color:"#854F0B",width:52}}>
+                                <select value={p} onChange={e=>setOrario(s.id, gio, m, Number(e.target.value), ini)}
+                                  style={{...inp,padding:"4px 6px",background:"#FAEEDA",borderColor:"#EF9F27",color:"#854F0B",width:62}}>
                                   <option value={0}>–</option>
                                   {Array.from({length:mp},(_,k)=>k+1).map(n=><option key={n} value={n}>+{n}</option>)}
                                 </select>
                               ) : (
-                                <button onClick={()=>setOrario(s.id, gio, m, 1)} disabled={mp===0}
+                                <button onClick={()=>setOrario(s.id, gio, m, 1, ini)} disabled={mp===0}
                                   title={mp===0?"Non c'è spazio per il pomeriggio":"Aggiungi ore pomeridiane"}
-                                  style={{...inp,padding:"4px 6px",width:52,cursor:mp===0?"default":"pointer",opacity:mp===0?0.4:1,color:"var(--color-text-tertiary)"}}>+</button>
+                                  style={{...inp,padding:"4px 6px",width:62,cursor:mp===0?"default":"pointer",opacity:mp===0?0.4:1,color:"var(--color-text-tertiary)"}}>+</button>
                               )}
                               {salvato[s.id+"|"+gio]
                                 ? <span style={{fontSize:9,color:"#3B6D11",fontWeight:600}}>✓ salvato</span>
@@ -1003,7 +1029,7 @@ function Registro({ ruolo, onLogout }) {
                           })}
                         </div>
                         <div style={{fontSize:11,color:"var(--color-text-tertiary)",marginTop:10}}>
-                          Il primo selettore indica le ore del mattino a partire dalle 8:30 (5 = fino alle 13:30). Con <strong>+</strong> aggiungi le ore pomeridiane, che iniziano dopo <strong>un'ora di pausa</strong>: 5 ore + 2 pomeridiane significa 8:30–13:30, pausa, poi 14:30–16:30. Impostando <strong>0</strong> lo studente non ha lezione quel giorno e nel registro le caselle risultano non cliccabili. Le modifiche si salvano subito: la spunta <strong style={{color:"#3B6D11"}}>✓</strong> conferma che il dato è arrivato al server, e i giorni <strong style={{color:"#854F0B"}}>evidenziati</strong> sono quelli diversi dall'orario predefinito.
+                          I tre selettori indicano, nell'ordine: l'<strong>ora di ingresso</strong>, quante <strong>ore consecutive</strong> dura la lezione e l'eventuale <strong>coda pomeridiana</strong>, che inizia dopo <strong>un'ora di pausa</strong>. Esempi: ingresso 8:30 con 5 ore e +2 significa 8:30–13:30, pausa, poi 14:30–16:30; ingresso 13:30 con 4 ore e nessuna coda significa 13:30–17:30. Impostando <strong>0</strong> ore lo studente non ha lezione quel giorno e nel registro le caselle risultano non cliccabili. Le modifiche si salvano subito: la spunta <strong style={{color:"#3B6D11"}}>✓</strong> conferma che il dato è arrivato al server, e i giorni <strong style={{color:"#854F0B"}}>evidenziati</strong> sono quelli diversi dall'orario predefinito.
                         </div>
                       </div>
                     )}
