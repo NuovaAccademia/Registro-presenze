@@ -70,7 +70,10 @@ const ST = {
   assente:  { bg:'#FCEBEB', fg:'#A32D2D', fbg:'#FDF5F5', ffg:'#CE8B8B', l:'A' },
   ritardo:  { bg:'#FAEEDA', fg:'#854F0B', fbg:'#FCF7EE', ffg:'#C2A272', l:'R' },
 };
-const PRES_COLS = "id,studente_id,fascia,stato,giustificato,updated_at";
+const PRES_COLS = "id,studente_id,fascia,stato,giustificato,uscita,updated_at";
+const USCITE = [5, 10, 15, 20, 25, 30];   // minuti di anticipo, arrotondati ai cinque
+const C_USC_FISSA = { bg:"#E8E6F7", fg:"#4A3B8F", bd:"#6B5DC7" };   // indaco: uscita autorizzata
+const C_USC_SEGN  = { bg:"#FAE9E7", fg:"#8F2D22", bd:"#C0392B" };   // rosso: uscita segnalata dal docente
 const IDLE_MS = 15 * 60 * 1000;   // oltre questo tempo di inattività il refresh si sospende
 const POLL_MS = 25000;
 const FULL_EVERY_MS = 5 * 60 * 1000;  // ogni tanto una ricarica completa: le righe cancellate
@@ -358,6 +361,8 @@ function Registro({ ruolo, onLogout }) {
   const [editStu, setEditStu] = useState(null);
   const [openOrario, setOpenOrario] = useState(null);
   const [salvato, setSalvato] = useState({});   // riscontri "salvato" temporanei, per studente e giorno
+  const [uscitaModal, setUscitaModal] = useState(null);   // {sid, h}
+  const [noteModal, setNoteModal] = useState(null);       // {sid}
   const [, setTick] = useState(0);
   const noticeTimer = useRef(null);
   const lastAct = useRef(Date.now());
@@ -490,6 +495,27 @@ function Registro({ ruolo, onLogout }) {
     const rec = orari.find(o => o.studente_id === sid && o.giorno === giorno);
     return rec ? (rec.inizio || 0) : 0;
   };
+  const uscitaOf = (sid, giorno) => {
+    const rec = orari.find(o => o.studente_id === sid && o.giorno === giorno);
+    return rec ? (rec.uscita || 0) : 0;
+  };
+  // Uscita autorizzata valida per la data mostrata, e fascia su cui ricade
+  // (sempre l'ultima prevista dall'orario di quel giorno).
+  const uscitaFissa = (sid) => {
+    const g = weekdayOf(date);
+    if (g === 0) return null;
+    const min = uscitaOf(sid, g);
+    if (!min) return null;
+    const f = fasceGiorno(orari, sid, date).fasce;
+    if (!f.length) return null;
+    return { min, fascia: f[f.length-1] };
+  };
+  // Da minuti di anticipo all'ora effettiva: 10 minuti sulla fascia 12:30 → 13:20
+  const oraUscita = (fascia, min) => {
+    const [hh, mm] = HOUR_END[fascia].split(":").map(Number);
+    const t = hh*60 + mm - min;
+    return String(Math.floor(t/60)).padStart(2,"0") + ":" + String(t%60).padStart(2,"0");
+  };
 
   // Orario predefinito: inizio alle 8:30, 6 ore dal lunedì al venerdì,
   // sabato libero, nessun pomeriggio. Il confronto è sui valori effettivi,
@@ -500,7 +526,7 @@ function Registro({ ruolo, onLogout }) {
     return false;
   };
   const giornoPersonalizzato = (sid, g) =>
-    oreOf(sid, g) !== (g === 6 ? 0 : 6) || pomOf(sid, g) !== 0 || iniOf(sid, g) !== 0;
+    oreOf(sid, g) !== (g === 6 ? 0 : 6) || pomOf(sid, g) !== 0 || iniOf(sid, g) !== 0 || uscitaOf(sid, g) !== 0;
 
 
   const oggiISO = new Date().toISOString().split("T")[0];
@@ -543,9 +569,11 @@ function Registro({ ruolo, onLogout }) {
         if (existing?.id) await api(`presenze?id=eq.${existing.id}`, { method: "DELETE" });
         setPresenze(prev => prev.filter(p => !(p.studente_id === sid && p.fascia === h)));
       } else {
+        // L'uscita anticipata ha senso solo su chi risulta presente: cambiando
+        // stato la segnalazione decade, altrimenti resterebbe appesa a un'assenza.
         const saved = await api("presenze?on_conflict=studente_id,data,fascia", {
           method: "POST", headers: WRITE_BACK,
-          body: JSON.stringify({ studente_id: sid, data: date, fascia: h, stato: next, giustificato: false }),
+          body: JSON.stringify({ studente_id: sid, data: date, fascia: h, stato: next, giustificato: false, uscita: next==='presente' ? (existing?.uscita ?? null) : null }),
         });
         mergeLocal(saved || []);
       }
@@ -562,7 +590,7 @@ function Registro({ ruolo, onLogout }) {
     try {
       const saved = await api("presenze?on_conflict=studente_id,data,fascia", {
         method: "POST", headers: WRITE_BACK,
-        body: JSON.stringify(fasce.map(h => ({ studente_id: sid, data: date, fascia: h, stato: status, giustificato: false }))),
+        body: JSON.stringify(fasce.map(h => ({ studente_id: sid, data: date, fascia: h, stato: status, giustificato: false, uscita: status==='presente' ? (presKey(sid,h)?.uscita ?? null) : null }))),
       });
       mergeLocal(saved || []);
     } catch (e) { handleErr(e); loadPresenze(); }
@@ -589,8 +617,8 @@ function Registro({ ruolo, onLogout }) {
     }
 
     const righe = [
-      { studente_id: sid, data: date, fascia: h, stato: existing.stato, giustificato: attiva },
-      ...seguenti.map(x => ({ studente_id: sid, data: date, fascia: x, stato: 'assente', giustificato: true })),
+      { studente_id: sid, data: date, fascia: h, stato: existing.stato, giustificato: attiva, uscita: existing.uscita ?? null },
+      ...seguenti.map(x => ({ studente_id: sid, data: date, fascia: x, stato: 'assente', giustificato: true, uscita: null })),
     ];
     try {
       const saved = await api("presenze?on_conflict=studente_id,data,fascia", {
@@ -610,27 +638,29 @@ function Registro({ ruolo, onLogout }) {
     try {
       const saved = await api("presenze?on_conflict=studente_id,data,fascia", {
         method: "POST", headers: WRITE_BACK,
-        body: JSON.stringify(rows.map(r => ({ studente_id: sid, data: date, fascia: r.fascia, stato: r.stato, giustificato: newVal }))),
+        body: JSON.stringify(rows.map(r => ({ studente_id: sid, data: date, fascia: r.fascia, stato: r.stato, giustificato: newVal, uscita: r.uscita ?? null }))),
       });
       mergeLocal(saved || []);
       say(newVal ? "Giornata giustificata." : "Giustificazione rimossa.");
     } catch (e) { handleErr(e); loadPresenze(); }
   };
 
-  const setOrario = async (sid, giorno, ore, pom, inizio) => {
+  const setOrario = async (sid, giorno, ore, pom, inizio, uscita) => {
     // I tre valori si vincolano a vicenda: spostando l'inizio in avanti si
     // riduce lo spazio disponibile, quindi ore e pomeriggio vengono ridimensionati.
     const i = Math.max(0, Math.min(inizio === undefined ? iniOf(sid, giorno) : inizio, HOURS.length - 1));
     const o = Math.min(ore, maxOre(i));
     const p = Math.min(pom, maxPom(o, i));
+    // Un'uscita anticipata su un giorno senza lezione non significa nulla
+    const u = o === 0 ? 0 : (uscita === undefined ? uscitaOf(sid, giorno) : uscita);
     setOrari(prev => {
       const others = prev.filter(o2 => !(o2.studente_id===sid && o2.giorno===giorno));
-      return [...others, { studente_id: sid, giorno, ore: o, pom: p, inizio: i }];
+      return [...others, { studente_id: sid, giorno, ore: o, pom: p, inizio: i, uscita: u }];
     });
     try {
       await api("orari?on_conflict=studente_id,giorno", {
         method: "POST", headers: WRITE,
-        body: JSON.stringify({ studente_id: sid, giorno, ore: o, pom: p, inizio: i }),
+        body: JSON.stringify({ studente_id: sid, giorno, ore: o, pom: p, inizio: i, uscita: u }),
       });
       // La spunta compare solo a scrittura riuscita: è la conferma che il dato
       // è arrivato al server, non il semplice riflesso del clic.
@@ -711,6 +741,30 @@ function Registro({ ruolo, onLogout }) {
     } catch (e) { handleErr(e); }
   };
 
+  // Uscita segnalata dal docente su una singola ora. min null = rimuove la segnalazione.
+  const setUscita = async (sid, h, min) => {
+    const existing = presKey(sid, h);
+    if (!existing || existing.stato !== 'presente') return;
+    try {
+      const saved = await api("presenze?on_conflict=studente_id,data,fascia", {
+        method: "POST", headers: WRITE_BACK,
+        body: JSON.stringify({ studente_id: sid, data: date, fascia: h, stato: 'presente', giustificato: !!existing.giustificato, uscita: min }),
+      });
+      mergeLocal(saved || []);
+      setUscitaModal(null);
+    } catch (e) { handleErr(e); loadPresenze(); }
+  };
+
+  const setNote = async (sid, testo) => {
+    if (!isSegreteria) return;
+    const t = (testo||"").trim().slice(0, 500);
+    try {
+      await api(`studenti?id=eq.${sid}`, { method: "PATCH", headers:{Prefer:"return=minimal"}, body: JSON.stringify({ note: t || null }) });
+      setStudents(prev => prev.map(s => s.id===sid ? { ...s, note: t || null } : s));
+      setNoteModal(null);
+    } catch (e) { handleErr(e); }
+  };
+
   const renameStu = async (id, nome) => {
     const n = (nome||"").trim(); if (!n) return;
     try { await api(`studenti?id=eq.${id}`, { method: "PATCH", headers:{Prefer:"return=minimal"}, body: JSON.stringify({ nome:n }) }); setEditStu(null); loadAll(); }
@@ -736,6 +790,113 @@ function Registro({ ruolo, onLogout }) {
     );
   };
 
+  // Pallino dell'uscita anticipata, in basso a destra della casella.
+  // Indaco = autorizzata dalla segreteria nell'orario; rosso = segnalata dal
+  // docente su quella singola ora. Il rosso ha la precedenza perché è
+  // l'eccezione da notare; l'autorizzazione resta scritta nel suggerimento.
+  const uscitaBadge = (sid,h,state,size) => {
+    const pres = presKey(sid,h);
+    const segn = pres && pres.uscita ? pres.uscita : 0;
+    const fissa = uscitaFissa(sid);
+    const fissaQui = fissa && fissa.fascia === h ? fissa.min : 0;
+    const modificabile = state === 'presente' && (isSegreteria || !motivoBlocco(h));
+    if (!segn && !fissaQui && !modificabile) return null;
+    const c = segn ? C_USC_SEGN : C_USC_FISSA;
+    const val = segn || fissaQui;
+    const sz = size || 15;
+    const titolo = segn
+      ? `Uscita segnalata dal docente alle ${oraUscita(h,segn)} (${segn} minuti di anticipo)` + (fissaQui?` — autorizzata alle ${oraUscita(h,fissaQui)}`:"")
+      : (fissaQui ? `Uscita anticipata autorizzata alle ${oraUscita(h,fissaQui)} (${fissaQui} minuti)` : "Segnala un'uscita anticipata");
+    return (
+      <span onClick={(e)=>{ if(!modificabile) return; e.stopPropagation(); setUscitaModal({sid,h}); }}
+        title={titolo}
+        style={{position:"absolute",bottom:-sz/3,right:-sz/3,width:sz,height:sz,borderRadius:"50%",fontSize:sz*0.47,fontWeight:600,lineHeight:sz+"px",textAlign:"center",cursor:modificabile?"pointer":"default",
+          background:val?c.bg:"var(--color-background-primary)",
+          color:val?c.fg:"var(--color-text-tertiary)",
+          border:`1px solid ${val?c.bd:"var(--color-border-secondary)"}`}}>{val||"→"}</span>
+    );
+  };
+
+  // Riquadro centrale condiviso dai due dialoghi
+  const modalBox = (titolo, sottotitolo, corpo) => (
+    <div onClick={()=>{setUscitaModal(null);setNoteModal(null);}}
+      style={{position:"fixed",inset:0,background:"#00000055",display:"flex",alignItems:"center",justifyContent:"center",padding:16,zIndex:50}}>
+      <div onClick={e=>e.stopPropagation()}
+        style={{background:"var(--color-background-primary)",borderRadius:"var(--border-radius-lg)",border:"0.5px solid var(--color-border-secondary)",padding:18,width:"100%",maxWidth:380,boxShadow:"0 8px 30px #00000022"}}>
+        <div style={{fontSize:15,fontWeight:500,marginBottom:2}}>{titolo}</div>
+        <div style={{fontSize:12,color:"var(--color-text-tertiary)",marginBottom:14}}>{sottotitolo}</div>
+        {corpo}
+      </div>
+    </div>
+  );
+
+  const uscitaDialog = () => {
+    if (!uscitaModal) return null;
+    const { sid, h } = uscitaModal;
+    const stu = students.find(s=>s.id===sid);
+    const pres = presKey(sid,h);
+    const attuale = pres && pres.uscita ? pres.uscita : 0;
+    const fissa = uscitaFissa(sid);
+    const fissaQui = fissa && fissa.fascia === h ? fissa.min : 0;
+    return modalBox(
+      stu ? stu.nome : "Uscita anticipata",
+      `Ora ${h}–${HOUR_END[h]}` + (fissaQui ? ` · uscita autorizzata alle ${oraUscita(h,fissaQui)}` : ""),
+      <div>
+        <div style={{fontSize:12,color:"var(--color-text-secondary)",marginBottom:10}}>A che ora è uscito? Gli orari sono arrotondati ai cinque minuti.</div>
+        <div style={{display:"grid",gridTemplateColumns:"repeat(3,1fr)",gap:6,marginBottom:12}}>
+          {USCITE.map(m=>(
+            <button key={m} onClick={()=>setUscita(sid,h,m)}
+              style={{...b,padding:"9px 4px",textAlign:"center",fontWeight:attuale===m?600:400,
+                background:attuale===m?C_USC_SEGN.bg:"transparent",
+                borderColor:attuale===m?C_USC_SEGN.bd:"var(--color-border-secondary)",
+                color:attuale===m?C_USC_SEGN.fg:"var(--color-text-primary)"}}>
+              {oraUscita(h,m)}<span style={{display:"block",fontSize:10,opacity:0.7}}>−{m} min</span>
+            </button>
+          ))}
+        </div>
+        <div style={{display:"flex",gap:8,justifyContent:"flex-end"}}>
+          {attuale>0 && <button style={b} onClick={()=>setUscita(sid,h,null)}>Rimuovi</button>}
+          <button style={b} onClick={()=>setUscitaModal(null)}>Annulla</button>
+        </div>
+      </div>
+    );
+  };
+
+  const noteDialog = () => {
+    if (!noteModal) return null;
+    const stu = students.find(s=>s.id===noteModal.sid);
+    if (!stu) return null;
+    if (!isSegreteria) return modalBox(stu.nome, "Note della segreteria",
+      <div>
+        <div style={{fontSize:13,whiteSpace:"pre-wrap",lineHeight:1.5,color:"var(--color-text-primary)",background:"var(--color-background-secondary)",borderRadius:"var(--border-radius-md)",padding:12,marginBottom:12}}>{stu.note || "Nessuna nota."}</div>
+        <div style={{display:"flex",justifyContent:"flex-end"}}><button style={b} onClick={()=>setNoteModal(null)}>Chiudi</button></div>
+      </div>
+    );
+    return modalBox(stu.nome, "Note visibili anche ai docenti",
+      <div>
+        <textarea defaultValue={stu.note||""} maxLength={500} id="note-testo" rows={5}
+          placeholder="Es.: esce sempre alle 13:10 per il pullman"
+          style={{...inp,width:"100%",resize:"vertical",fontFamily:"inherit",lineHeight:1.45,marginBottom:8}} />
+        <div style={{fontSize:11,color:"var(--color-text-tertiary)",marginBottom:12,lineHeight:1.45}}>
+          Annotazioni <strong>organizzative</strong>: orari, trasporti, contatti. Trattandosi di minori, evita informazioni su salute, famiglia o comportamento, che richiederebbero tutele diverse da quelle previste per questo registro.
+        </div>
+        <div style={{display:"flex",gap:8,justifyContent:"flex-end"}}>
+          <button style={b} onClick={()=>setNoteModal(null)}>Annulla</button>
+          <button style={bBlue} onClick={()=>setNote(stu.id, document.getElementById("note-testo").value)}>Salva</button>
+        </div>
+      </div>
+    );
+  };
+
+  const noteBadge = (s) => {
+    if (!s.note && !isSegreteria) return null;
+    return (
+      <span onClick={(e)=>{e.stopPropagation();setNoteModal({sid:s.id});}}
+        title={s.note ? "Note: " + s.note : "Aggiungi una nota"}
+        style={{marginLeft:5,cursor:"pointer",fontSize:11,opacity:s.note?1:0.35,color:s.note?"#1F3864":"var(--color-text-tertiary)"}}>✎</span>
+    );
+  };
+
   const registerView = () => {
     if (!cls) return classes.length>0 ? <div style={{padding:"20px 0",color:"var(--color-text-tertiary)",fontSize:14}}>Seleziona una classe.</div> : null;
 
@@ -750,6 +911,7 @@ function Registro({ ruolo, onLogout }) {
             <div key={s.id} style={{background:"var(--color-background-primary)",border:"0.5px solid var(--color-border-tertiary)",borderRadius:"var(--border-radius-lg)",padding:"12px 12px 14px",marginBottom:10}}>
               <div style={{display:"flex",alignItems:"center",gap:8,marginBottom:10}}>
                 <span style={{flex:1,fontSize:15,fontWeight:500}}>{s.nome}
+                  {noteBadge(s)}
                   {classNamesOf(s.id).length>1 && <span style={{fontSize:11,fontWeight:400,color:"var(--color-text-tertiary)",marginLeft:6}}>· più classi</span>}
                   {f.p>0 && <span style={{fontSize:11,fontWeight:400,color:"var(--color-text-tertiary)",marginLeft:6}}>· {f.m}+{f.p}</span>}
                   {f.fasce.length===0 && <span style={{fontSize:11,fontWeight:400,color:"var(--color-text-tertiary)",marginLeft:6}}>· nessuna lezione</span>}
@@ -788,6 +950,7 @@ function Registro({ ruolo, onLogout }) {
                         <span style={{fontSize:20,fontWeight:600}}>{info?info.l:"·"}</span>
                       </button>
                       {giustBadge(s.id,h,state,giustOf(s.id,h),20)}
+                      {uscitaBadge(s.id,h,state,20)}
                     </div>
                   );
                 })}
@@ -833,6 +996,7 @@ function Registro({ ruolo, onLogout }) {
                 <tr key={s.id} style={{borderTop:i>0?"0.5px solid var(--color-border-tertiary)":"none"}}>
                   <td style={{padding:"6px 12px",fontSize:13,opacity:f.fasce.length===0?0.55:1}}>{s.nome}
                     {classNamesOf(s.id).length>1 && <span title="Iscritto a più classi" style={{fontSize:10,color:"var(--color-text-tertiary)",marginLeft:5}}>●</span>}
+                    {noteBadge(s)}
                   </td>
                   {isSegreteria && (
                   <td style={{textAlign:"center",padding:"4px 2px"}}>
@@ -872,6 +1036,7 @@ function Registro({ ruolo, onLogout }) {
                             {previsto?(info?info.l:"·"):"–"}
                           </button>
                           {previsto && giustBadge(s.id,h,state,giustOf(s.id,h),15)}
+                          {previsto && uscitaBadge(s.id,h,state,15)}
                         </div>
                       </td>
                     );
@@ -892,6 +1057,8 @@ function Registro({ ruolo, onLogout }) {
 
   const content = (
     <>
+      {uscitaDialog()}
+      {noteDialog()}
       {view==="reg" && registerView()}
       {view==="stats" && cls && <StatsView cls={cls} clsStudents={clsStudents} date={date} orari={orari} />}
       {view==="export" && isSegreteria && <ExportView classes={classes} students={students} iscrizioni={iscrizioni} orari={orari} />}
@@ -977,6 +1144,9 @@ function Registro({ ruolo, onLogout }) {
                             onClick={()=>setOpenOrario(openOrario===s.id?null:s.id)}>
                             {orarioPersonalizzato(s.id) && <span style={{marginRight:5}}>●</span>}Orario
                           </button>
+                          <button style={s.note?{...b,background:"#E7F0F9",borderColor:"#2E75B5",color:"#1F3864"}:b}
+                            title={s.note?"Note: "+s.note:"Aggiungi una nota"}
+                            onClick={()=>setNoteModal({sid:s.id})}>✎</button>
                           <button style={b} onClick={()=>setEditStu({id:s.id,nome:s.nome})}>Rinomina</button>
                           <button style={{...b,color:"#A32D2D",borderColor:"#F09595"}} onClick={()=>remStu(s.id)} title={altre.length>0?"Toglie da questa classe":"Elimina lo studente"}>Rimuovi</button>
                         </>
@@ -1024,6 +1194,15 @@ function Registro({ ruolo, onLogout }) {
                               {salvato[s.id+"|"+gio]
                                 ? <span style={{fontSize:9,color:"#3B6D11",fontWeight:600}}>✓ salvato</span>
                                 : (fine && <span style={{fontSize:9,color:"var(--color-text-tertiary)"}}>fino {fine}</span>)}
+                              <select value={uscitaOf(s.id,gio)} onChange={e=>setOrario(s.id, gio, m, p, ini, Number(e.target.value))}
+                                title="Uscita anticipata autorizzata sull'ultima ora" disabled={m===0}
+                                style={{...inp,padding:"4px 4px",width:62,fontSize:10,opacity:m===0?0.4:1,
+                                  background:uscitaOf(s.id,gio)>0?C_USC_FISSA.bg:"var(--color-background-primary)",
+                                  borderColor:uscitaOf(s.id,gio)>0?C_USC_FISSA.bd:"var(--color-border-secondary)",
+                                  color:uscitaOf(s.id,gio)>0?C_USC_FISSA.fg:"var(--color-text-tertiary)"}}>
+                                <option value={0}>esce {fine||"—"}</option>
+                                {USCITE.map(u=><option key={u} value={u}>{fine?oraUscita(HOURS[ini+m-1+(p>0?p+1:0)],u):"−"+u+" min"}</option>)}
+                              </select>
                             </div>
                             );
                           })}
