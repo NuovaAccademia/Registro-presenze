@@ -53,6 +53,7 @@ const RUOLI = {
 
 const HOURS = ['08:30','09:30','10:30','11:30','12:30','13:30','14:30','15:30','16:30'];
 const HOUR_END = {'08:30':'09:30','09:30':'10:30','10:30':'11:30','11:30':'12:30','12:30':'13:30','13:30':'14:30','14:30':'15:30','15:30':'16:30','16:30':'17:30'};
+const BACKUP_FMT = 2;   // formato del file di backup: 2 = completo, con tutte le colonne
 const MAX_ORE = 6;   // durata massima del blocco principale
 const MAX_POM = 4;   // durata massima della coda pomeridiana (4 ore + pausa dopo 4 di mattina)
 // Quanti giorni passati un docente può ancora modificare (0 = solo oggi)
@@ -70,10 +71,11 @@ const ST = {
   assente:  { bg:'#FCEBEB', fg:'#A32D2D', fbg:'#FDF5F5', ffg:'#CE8B8B', l:'A' },
   ritardo:  { bg:'#FAEEDA', fg:'#854F0B', fbg:'#FCF7EE', ffg:'#C2A272', l:'R' },
 };
-const PRES_COLS = "id,studente_id,fascia,stato,giustificato,uscita,updated_at";
+const PRES_COLS = "id,studente_id,fascia,stato,giustificato,uscita,uscita_ok,updated_at";
 const USCITE = [5, 10, 15, 20, 25, 30];   // minuti di anticipo, arrotondati ai cinque
 const C_USC_FISSA = { bg:"#E8E6F7", fg:"#4A3B8F", bd:"#6B5DC7" };   // indaco: uscita autorizzata
-const C_USC_SEGN  = { bg:"#FAE9E7", fg:"#8F2D22", bd:"#C0392B" };   // rosso: uscita segnalata dal docente
+const C_USC_SEGN  = { bg:"#FAE9E7", fg:"#8F2D22", bd:"#C0392B" };   // rosso: uscita occasionale non autorizzata
+const C_USC_OK    = C_USC_FISSA;   // le uscite autorizzate dalla segreteria usano lo stesso indaco delle programmate
 const IDLE_MS = 15 * 60 * 1000;   // oltre questo tempo di inattività il refresh si sospende
 const POLL_MS = 25000;
 const FULL_EVERY_MS = 5 * 60 * 1000;  // ogni tanto una ricarica completa: le righe cancellate
@@ -240,12 +242,15 @@ function maxPom(m, ini) {
 function analizza(rows, orari, sid) {
   const byDay = {};
   rows.forEach(r => { (byDay[r.data] = byDay[r.data] || []).push(r); });
-  let pr=0, as=0, ri=0, gi=0;
+  let pr=0, as=0, ri=0, gi=0, usc=0, uscNo=0;
   const giorniAss = [];
   const oreParziali = [];
   rows.forEach(r => {
     if (r.stato==='presente') pr++; else if (r.stato==='assente') as++; else if (r.stato==='ritardo') ri++;
     if (r.giustificato && (r.stato==='assente' || r.stato==='ritardo')) gi++;
+    // Le uscite programmate nell'orario non finiscono qui: sono note in anticipo
+    // alla segreteria. Si contano solo quelle rilevate sul momento.
+    if (r.uscita) { usc++; if (!r.uscita_ok) uscNo++; }
   });
   Object.keys(byDay).sort().forEach(d => {
     const { fasce } = fasceGiorno(orari, sid, d);
@@ -261,7 +266,7 @@ function analizza(rows, orari, sid) {
         .forEach(r => oreParziali.push({ data: d, fascia: r.fascia, stato: r.stato, giustificato: r.giustificato }));
     }
   });
-  return { pr, as, ri, gi, giorniAss, oreParziali,
+  return { pr, as, ri, gi, usc, uscNo, giorniAss, oreParziali,
     gAss: giorniAss.length, gGiust: giorniAss.filter(g=>g.giustificato).length };
 }
 
@@ -499,6 +504,12 @@ function Registro({ ruolo, onLogout }) {
     const rec = orari.find(o => o.studente_id === sid && o.giorno === giorno);
     return rec ? (rec.uscita || 0) : 0;
   };
+  // Ultima ora prevista dall'orario dello studente per la data mostrata:
+  // è la sola su cui un docente può segnalare un'uscita anticipata.
+  const ultimaFascia = (sid) => {
+    const f = fasceGiorno(orari, sid, date).fasce;
+    return f.length ? f[f.length-1] : null;
+  };
   // Uscita autorizzata valida per la data mostrata, e fascia su cui ricade
   // (sempre l'ultima prevista dall'orario di quel giorno).
   const uscitaFissa = (sid) => {
@@ -506,9 +517,9 @@ function Registro({ ruolo, onLogout }) {
     if (g === 0) return null;
     const min = uscitaOf(sid, g);
     if (!min) return null;
-    const f = fasceGiorno(orari, sid, date).fasce;
-    if (!f.length) return null;
-    return { min, fascia: f[f.length-1] };
+    const f = ultimaFascia(sid);
+    if (!f) return null;
+    return { min, fascia: f };
   };
   // Da minuti di anticipo all'ora effettiva: 10 minuti sulla fascia 12:30 → 13:20
   const oraUscita = (fascia, min) => {
@@ -741,14 +752,17 @@ function Registro({ ruolo, onLogout }) {
     } catch (e) { handleErr(e); }
   };
 
-  // Uscita segnalata dal docente su una singola ora. min null = rimuove la segnalazione.
-  const setUscita = async (sid, h, min) => {
+  // Uscita segnalata su una singola ora. min null = rimuove la segnalazione.
+  // ok = autorizzata per quel giorno; solo la segreteria può dichiararlo.
+  const setUscita = async (sid, h, min, ok) => {
     const existing = presKey(sid, h);
     if (!existing || existing.stato !== 'presente') return;
+    if (!isSegreteria && h !== ultimaFascia(sid)) return;
     try {
       const saved = await api("presenze?on_conflict=studente_id,data,fascia", {
         method: "POST", headers: WRITE_BACK,
-        body: JSON.stringify({ studente_id: sid, data: date, fascia: h, stato: 'presente', giustificato: !!existing.giustificato, uscita: min }),
+        body: JSON.stringify({ studente_id: sid, data: date, fascia: h, stato: 'presente', giustificato: !!existing.giustificato,
+          uscita: min, uscita_ok: min ? (isSegreteria ? !!ok : false) : false }),
       });
       mergeLocal(saved || []);
       setUscitaModal(null);
@@ -791,26 +805,30 @@ function Registro({ ruolo, onLogout }) {
   };
 
   // Pallino dell'uscita anticipata, in basso a destra della casella.
-  // Indaco = autorizzata dalla segreteria nell'orario; rosso = segnalata dal
-  // docente su quella singola ora. Il rosso ha la precedenza perché è
-  // l'eccezione da notare; l'autorizzazione resta scritta nel suggerimento.
+  // Indaco = programmata nell'orario; verde = occasionale autorizzata dalla
+  // segreteria; rosso = occasionale non autorizzata. Il colore dell'uscita
+  // effettiva prevale su quello della programmazione, perché è il fatto
+  // accaduto a dover saltare all'occhio.
+  // I docenti possono intervenire solo sull'ultima ora prevista dall'orario:
+  // è lì che l'uscita anticipata ha senso. La segreteria, su qualsiasi ora.
   const uscitaBadge = (sid,h,state,size) => {
     const pres = presKey(sid,h);
     const segn = pres && pres.uscita ? pres.uscita : 0;
+    const ok = !!(pres && pres.uscita_ok);
     const fissa = uscitaFissa(sid);
     const fissaQui = fissa && fissa.fascia === h ? fissa.min : 0;
-    const modificabile = state === 'presente' && (isSegreteria || !motivoBlocco(h));
+    const modificabile = state === 'presente' && (isSegreteria || (!motivoBlocco(h) && h === ultimaFascia(sid)));
     if (!segn && !fissaQui && !modificabile) return null;
-    const c = segn ? C_USC_SEGN : C_USC_FISSA;
+    const c = segn ? (ok ? C_USC_OK : C_USC_SEGN) : C_USC_FISSA;
     const val = segn || fissaQui;
     const sz = size || 15;
     const titolo = segn
-      ? `Uscita segnalata dal docente alle ${oraUscita(h,segn)} (${segn} minuti di anticipo)` + (fissaQui?` — autorizzata alle ${oraUscita(h,fissaQui)}`:"")
-      : (fissaQui ? `Uscita anticipata autorizzata alle ${oraUscita(h,fissaQui)} (${fissaQui} minuti)` : "Segnala un'uscita anticipata");
+      ? `Uscita alle ${oraUscita(h,segn)} (${segn} minuti di anticipo) — ${ok?"autorizzata dalla segreteria":"NON autorizzata"}` + (fissaQui?` · uscita programmata alle ${oraUscita(h,fissaQui)}`:"")
+      : (fissaQui ? `Uscita anticipata programmata alle ${oraUscita(h,fissaQui)} (${fissaQui} minuti)` : "Segnala un'uscita anticipata");
     return (
       <span onClick={(e)=>{ if(!modificabile) return; e.stopPropagation(); setUscitaModal({sid,h}); }}
         title={titolo}
-        style={{position:"absolute",bottom:-sz/3,right:-sz/3,width:sz,height:sz,borderRadius:"50%",fontSize:sz*0.47,fontWeight:600,lineHeight:sz+"px",textAlign:"center",cursor:modificabile?"pointer":"default",
+        style={{position:"absolute",bottom:-sz/3,right:-sz/3,width:sz,height:sz,borderRadius:"50%",fontSize:sz*0.5,fontWeight:600,lineHeight:sz+"px",textAlign:"center",cursor:modificabile?"pointer":"default",
           background:val?c.bg:"var(--color-background-primary)",
           color:val?c.fg:"var(--color-text-tertiary)",
           border:`1px solid ${val?c.bd:"var(--color-border-secondary)"}`}}>{val||"→"}</span>
@@ -836,26 +854,47 @@ function Registro({ ruolo, onLogout }) {
     const stu = students.find(s=>s.id===sid);
     const pres = presKey(sid,h);
     const attuale = pres && pres.uscita ? pres.uscita : 0;
+    const ok = !!(pres && pres.uscita_ok);
     const fissa = uscitaFissa(sid);
     const fissaQui = fissa && fissa.fascia === h ? fissa.min : 0;
     return modalBox(
       stu ? stu.nome : "Uscita anticipata",
-      `Ora ${h}–${HOUR_END[h]}` + (fissaQui ? ` · uscita autorizzata alle ${oraUscita(h,fissaQui)}` : ""),
+      `Ora ${h}–${HOUR_END[h]}` + (fissaQui ? ` · uscita programmata alle ${oraUscita(h,fissaQui)}` : ""),
       <div>
         <div style={{fontSize:12,color:"var(--color-text-secondary)",marginBottom:10}}>A che ora è uscito? Gli orari sono arrotondati ai cinque minuti.</div>
         <div style={{display:"grid",gridTemplateColumns:"repeat(3,1fr)",gap:6,marginBottom:12}}>
           {USCITE.map(m=>(
-            <button key={m} onClick={()=>setUscita(sid,h,m)}
+            <button key={m} onClick={()=>setUscita(sid,h,m,ok)}
               style={{...b,padding:"9px 4px",textAlign:"center",fontWeight:attuale===m?600:400,
-                background:attuale===m?C_USC_SEGN.bg:"transparent",
-                borderColor:attuale===m?C_USC_SEGN.bd:"var(--color-border-secondary)",
-                color:attuale===m?C_USC_SEGN.fg:"var(--color-text-primary)"}}>
+                background:attuale===m?(ok?C_USC_OK.bg:C_USC_SEGN.bg):"transparent",
+                borderColor:attuale===m?(ok?C_USC_OK.bd:C_USC_SEGN.bd):"var(--color-border-secondary)",
+                color:attuale===m?(ok?C_USC_OK.fg:C_USC_SEGN.fg):"var(--color-text-primary)"}}>
               {oraUscita(h,m)}<span style={{display:"block",fontSize:10,opacity:0.7}}>−{m} min</span>
             </button>
           ))}
         </div>
+        {isSegreteria ? (
+          <div style={{marginBottom:12}}>
+            <div style={{fontSize:12,color:"var(--color-text-secondary)",marginBottom:6}}>Per oggi questa uscita è:</div>
+            <div style={{display:"flex",gap:6}}>
+              <button disabled={!attuale} onClick={()=>setUscita(sid,h,attuale,true)}
+                style={{...b,flex:1,opacity:attuale?1:0.4,fontWeight:ok?600:400,
+                  background:ok?C_USC_OK.bg:"transparent",borderColor:ok?C_USC_OK.bd:"var(--color-border-secondary)",color:ok?C_USC_OK.fg:"var(--color-text-primary)"}}>Autorizzata</button>
+              <button disabled={!attuale} onClick={()=>setUscita(sid,h,attuale,false)}
+                style={{...b,flex:1,opacity:attuale?1:0.4,fontWeight:!ok&&attuale?600:400,
+                  background:(!ok&&attuale)?C_USC_SEGN.bg:"transparent",borderColor:(!ok&&attuale)?C_USC_SEGN.bd:"var(--color-border-secondary)",color:(!ok&&attuale)?C_USC_SEGN.fg:"var(--color-text-primary)"}}>Non autorizzata</button>
+            </div>
+            <div style={{fontSize:11,color:"var(--color-text-tertiary)",marginTop:6,lineHeight:1.45}}>
+              Nello Storico si conteggiano solo le uscite <strong>non autorizzate</strong>.
+            </div>
+          </div>
+        ) : (
+          <div style={{fontSize:11,color:"var(--color-text-tertiary)",marginBottom:12,lineHeight:1.45}}>
+            La segnalazione arriva alla segreteria come <strong>non autorizzata</strong>; sarà la segreteria a valutarla.
+          </div>
+        )}
         <div style={{display:"flex",gap:8,justifyContent:"flex-end"}}>
-          {attuale>0 && <button style={b} onClick={()=>setUscita(sid,h,null)}>Rimuovi</button>}
+          {attuale>0 && <button style={b} onClick={()=>setUscita(sid,h,null,false)}>Rimuovi</button>}
           <button style={b} onClick={()=>setUscitaModal(null)}>Annulla</button>
         </div>
       </div>
@@ -960,7 +999,8 @@ function Registro({ ruolo, onLogout }) {
           })}
           <div style={{fontSize:11,color:"var(--color-text-tertiary)",marginTop:4,paddingLeft:2}}>
             Le fasce con il trattino non sono previste dall'orario dello studente. La pallina <strong>G</strong> indica le giustificazioni{isSegreteria?" — toccala per giustificare.":"."}
-            {!isSegreteria && <span> Le celle tratteggiate o sbiadite non sono modificabili: puoi segnare solo l'ora attualmente in corso.</span>}
+            <span> Il pallino in basso a destra riguarda le <strong>uscite anticipate</strong>: <span style={{color:C_USC_FISSA.fg,fontWeight:600}}>indaco</span> se autorizzata — programmata nell'orario oppure approvata dalla segreteria — e <span style={{color:C_USC_SEGN.fg,fontWeight:600}}>rosso</span> se non autorizzata; il numero sono i minuti di anticipo.</span>
+            {!isSegreteria && <span> Le celle tratteggiate o sbiadite non sono modificabili: puoi segnare solo l'ora attualmente in corso. Puoi segnalare un'uscita anticipata solo sull'ultima ora prevista dall'orario dello studente.</span>}
           </div>
         </div>
       );
@@ -1049,7 +1089,8 @@ function Registro({ ruolo, onLogout }) {
         </div>
         <div style={{fontSize:11,color:"var(--color-text-tertiary)",marginTop:8,paddingLeft:2}}>
           Le fasce con il trattino <strong>–</strong> non sono previste dall'orario dello studente; <strong>pausa</strong> indica l'ora di stacco fra mattina e pomeriggio. La pallina <strong>G</strong> segnala le giustificazioni{isSegreteria?" — cliccala per giustificare.":" (solo la segreteria può modificarle)."} Il pallino <strong>●</strong> indica chi è iscritto a più classi.
-                      {!isSegreteria && <span> Le celle tratteggiate o sbiadite non sono modificabili: puoi segnare solo l'ora attualmente in corso.</span>}
+                      <span> Il pallino in basso a destra riguarda le <strong>uscite anticipate</strong>: <span style={{color:C_USC_FISSA.fg,fontWeight:600}}>indaco</span> se autorizzata — programmata nell'orario oppure approvata dalla segreteria — e <span style={{color:C_USC_SEGN.fg,fontWeight:600}}>rosso</span> se non autorizzata; il numero sono i minuti di anticipo.</span>
+            {!isSegreteria && <span> Le celle tratteggiate o sbiadite non sono modificabili: puoi segnare solo l'ora attualmente in corso. Puoi segnalare un'uscita anticipata solo sull'ultima ora prevista dall'orario dello studente.</span>}
         </div>
       </div>
     );
@@ -1061,7 +1102,7 @@ function Registro({ ruolo, onLogout }) {
       {noteDialog()}
       {view==="reg" && registerView()}
       {view==="stats" && cls && <StatsView cls={cls} clsStudents={clsStudents} date={date} orari={orari} />}
-      {view==="export" && isSegreteria && <ExportView classes={classes} students={students} iscrizioni={iscrizioni} orari={orari} />}
+      {view==="export" && isSegreteria && <ExportView classes={classes} students={students} iscrizioni={iscrizioni} orari={orari} onReload={()=>{loadAll();loadPresenze();}} />}
       {view==="manage" && isSegreteria && (
         <div>
           <div style={{marginBottom:20}}>
@@ -1310,7 +1351,7 @@ function StatsView({ cls, clsStudents, date, orari }) {
         if (period === "day") filter = `&data=eq.${date}`;
         else if (period === "month") { const r = monthRange(date.slice(0,7)); filter = `&data=gte.${r.start}&data=lt.${r.endExcl}`; }
         else filter = `&data=gte.${sy.start}&data=lt.${sy.endExcl}`;
-        const p = await api(`presenze?select=studente_id,data,fascia,stato,giustificato&studente_id=in.(${idsKey})${filter}`);
+        const p = await api(`presenze?select=studente_id,data,fascia,stato,giustificato,uscita,uscita_ok&studente_id=in.(${idsKey})${filter}`);
         if (annullato) return;
         const perStu = {};
         (p||[]).forEach(r => { (perStu[r.studente_id] = perStu[r.studente_id] || []).push(r); });
@@ -1347,11 +1388,12 @@ function StatsView({ cls, clsStudents, date, orari }) {
               <th style={{...th,textAlign:"center"}}>di cui giustif.</th>
               <th style={{...th,textAlign:"center"}}>Giorni assenza</th>
               <th style={{...th,textAlign:"center"}}>Giorni giustif.</th>
+              <th style={{...th,textAlign:"center"}}>Uscite anticip.</th>
             </tr>
           </thead>
           <tbody>
-            {!stats && <tr><td colSpan={7} style={{padding:"16px 12px",fontSize:13,color:"var(--color-text-tertiary)"}}>Caricamento…</td></tr>}
-            {stats && stats.length===0 && <tr><td colSpan={7} style={{padding:"16px 12px",fontSize:13,color:"var(--color-text-tertiary)"}}>Nessuno studente.</td></tr>}
+            {!stats && <tr><td colSpan={8} style={{padding:"16px 12px",fontSize:13,color:"var(--color-text-tertiary)"}}>Caricamento…</td></tr>}
+            {stats && stats.length===0 && <tr><td colSpan={8} style={{padding:"16px 12px",fontSize:13,color:"var(--color-text-tertiary)"}}>Nessuno studente.</td></tr>}
             {stats && stats.map((s,i)=>(
               <tr key={s.id} style={{borderTop:i>0?"0.5px solid var(--color-border-tertiary)":"none"}}>
                 <td style={{padding:"8px 12px",fontSize:14}}>{s.nome}</td>
@@ -1361,6 +1403,9 @@ function StatsView({ cls, clsStudents, date, orari }) {
                 <td style={{textAlign:"center",fontSize:14,color:"#3B6D11",fontWeight:500}}>{s.gi}</td>
                 <td style={{textAlign:"center",fontSize:14,color:"#A32D2D",fontWeight:500}}>{s.gAss}</td>
                 <td style={{textAlign:"center",fontSize:14,color:"#3B6D11",fontWeight:500}}>{s.gGiust}</td>
+                <td style={{textAlign:"center",fontSize:14,fontWeight:500,color:s.uscNo>0?"#8F2D22":"var(--color-text-tertiary)"}}>
+                  {s.uscNo}{s.usc>s.uscNo && <span style={{fontSize:11,fontWeight:400,color:"var(--color-text-tertiary)"}}> su {s.usc}</span>}
+                </td>
               </tr>
             ))}
           </tbody>
@@ -1368,6 +1413,7 @@ function StatsView({ cls, clsStudents, date, orari }) {
       </div>
       <div style={{fontSize:11,color:"var(--color-text-tertiary)",marginTop:8}}>
         Un <strong>giorno di assenza</strong> è conteggiato quando lo studente risulta assente in tutte le ore previste dal suo orario per quel giorno.
+        Le <strong>uscite anticipate</strong> riportano quelle non autorizzate sul totale di quelle rilevate: le uscite programmate nell'orario non sono conteggiate, perché già concordate con la segreteria.
       </div>
     </React.Fragment>
   );
@@ -1375,12 +1421,15 @@ function StatsView({ cls, clsStudents, date, orari }) {
 
 /* ================= esportazione e backup ================= */
 
-function ExportView({ classes, students, iscrizioni, orari }) {
+function ExportView({ classes, students, iscrizioni, orari, onReload }) {
   const [clsId, setClsId] = useState(classes[0]?.id || "");
   const [stuId, setStuId] = useState("");
   const [month, setMonth] = useState(new Date().toISOString().slice(0,7));
   const [busy, setBusy] = useState(false);
   const [bkBusy, setBkBusy] = useState(false);
+  const [piano, setPiano] = useState(null);     // contenuto del backup letto, in attesa di conferma
+  const [rsBusy, setRsBusy] = useState(false);
+  const [avanz, setAvanz] = useState("");
   const [err, setErr] = useState(null);
   const [msg, setMsg] = useState(null);
 
@@ -1519,15 +1568,87 @@ ${inner}
       const nomeStu = {}; st.forEach(s => { nomeStu[s.id] = s.nome; });
       const nomeCls = {}; cl.forEach(c => { nomeCls[c.id] = c.nome; });
       const wb = XLSX.utils.book_new();
-      XLSX.utils.book_append_sheet(wb, XLSX.utils.json_to_sheet(cl.map(c=>({ id:c.id, Nome:c.nome }))), "Classi");
-      XLSX.utils.book_append_sheet(wb, XLSX.utils.json_to_sheet(st.map(s=>({ id:s.id, Nome:s.nome }))), "Studenti");
+      // Il backup riporta TUTTE le colonne reali, non solo quelle leggibili:
+      // è il file da cui dipende il ripristino, e ciò che non viene scritto qui
+      // andrebbe perso per sempre. Le colonne con l'iniziale maiuscola servono
+      // a chi apre il foglio, quelle minuscole sono i dati veri.
+      XLSX.utils.book_append_sheet(wb, XLSX.utils.json_to_sheet(cl.map(c=>({ id:c.id, Nome:c.nome, nome:c.nome, colore:c.colore||"" }))), "Classi");
+      XLSX.utils.book_append_sheet(wb, XLSX.utils.json_to_sheet(st.map(s=>({ id:s.id, Nome:s.nome, nome:s.nome, note:s.note||"" }))), "Studenti");
       XLSX.utils.book_append_sheet(wb, XLSX.utils.json_to_sheet(isc.map(i=>({ studente_id:i.studente_id, Studente:nomeStu[i.studente_id]||"", classe_id:i.classe_id, Classe:nomeCls[i.classe_id]||"" }))), "Iscrizioni");
-      XLSX.utils.book_append_sheet(wb, XLSX.utils.json_to_sheet(or_.map(o=>({ studente_id:o.studente_id, Studente:nomeStu[o.studente_id]||"", Giorno:GIORNI[o.giorno-1]||o.giorno, giorno_num:o.giorno, "Ore mattina":o.ore, "Ore pomeriggio":o.pom||0 }))), "Orari");
-      XLSX.utils.book_append_sheet(wb, XLSX.utils.json_to_sheet(pres.map(p=>({ studente_id:p.studente_id, Studente:nomeStu[p.studente_id]||"", Data:p.data, Fascia:p.fascia, Stato:p.stato, Giustificato:p.giustificato?"Sì":"No" }))), "Presenze");
+      XLSX.utils.book_append_sheet(wb, XLSX.utils.json_to_sheet(or_.map(o=>({ studente_id:o.studente_id, Studente:nomeStu[o.studente_id]||"", Giorno:GIORNI[o.giorno-1]||o.giorno, giorno:o.giorno, inizio:o.inizio||0, ore:o.ore, pom:o.pom||0, uscita:o.uscita||0 }))), "Orari");
+      XLSX.utils.book_append_sheet(wb, XLSX.utils.json_to_sheet(pres.map(p=>({ studente_id:p.studente_id, Studente:nomeStu[p.studente_id]||"", data:p.data, fascia:p.fascia, stato:p.stato, giustificato:p.giustificato?1:0, uscita:p.uscita==null?"":p.uscita, uscita_ok:p.uscita_ok?1:0 }))), "Presenze");
+      XLSX.utils.book_append_sheet(wb, XLSX.utils.json_to_sheet([{ formato:BACKUP_FMT, generato:new Date().toISOString(), classi:cl.length, studenti:st.length, iscrizioni:isc.length, orari:or_.length, presenze:pres.length }]), "Info");
       const oggi = new Date().toISOString().split("T")[0];
       XLSX.writeFile(wb, `backup_registro_${oggi}.xlsx`);
       setMsg(`Backup completato: ${pres.length} registrazioni, ${st.length} studenti. Conservalo in un posto sicuro (es. Drive).`);
     } catch(e){ setErr("Errore nel backup: "+(e.message||"")); } finally { setBkBusy(false); }
+  };
+
+  // ---- Ripristino integrativo da backup -------------------------------
+  // Rimette le righe contenute nel file senza cancellare nulla: ciò che è
+  // sparito torna, ciò che esiste viene riallineato al backup, ciò che è
+  // stato creato dopo resta. Non è un "torna indietro nel tempo".
+  const leggiBackup = async (file) => {
+    setErr(null); setMsg(null); setPiano(null);
+    try {
+      const wb = XLSX.read(await file.arrayBuffer(), { type: "array" });
+      const foglio = (n) => wb.Sheets[n] ? XLSX.utils.sheet_to_json(wb.Sheets[n], { defval: null }) : [];
+      const vero = (v) => v === true || v === 1 || v === "1" || v === "Sì" || v === "Si" || v === "true";
+      const num = (v, d) => { const n = Number(v); return Number.isFinite(n) ? n : d; };
+
+      // I backup precedenti usavano intestazioni diverse: si accettano entrambe,
+      // e ciò che manca assume il valore predefinito della colonna.
+      const classi = foglio("Classi").filter(r=>r.id).map(r => ({
+        id: r.id, nome: r.nome || r.Nome || "", colore: r.colore || null }));
+      const studenti = foglio("Studenti").filter(r=>r.id).map(r => ({
+        id: r.id, nome: r.nome || r.Nome || "", note: r.note || null }));
+      const iscrizioni = foglio("Iscrizioni").filter(r=>r.studente_id && r.classe_id).map(r => ({
+        studente_id: r.studente_id, classe_id: r.classe_id }));
+      const orari = foglio("Orari").filter(r=>r.studente_id).map(r => ({
+        studente_id: r.studente_id, giorno: num(r.giorno ?? r.giorno_num, 0),
+        ore: num(r.ore ?? r["Ore mattina"], 0), pom: num(r.pom ?? r["Ore pomeriggio"], 0),
+        inizio: num(r.inizio, 0), uscita: num(r.uscita, 0) })).filter(o=>o.giorno>=1 && o.giorno<=6);
+      const presenze = foglio("Presenze").filter(r=>r.studente_id).map(r => ({
+        studente_id: r.studente_id, data: String(r.data ?? r.Data ?? "").slice(0,10),
+        fascia: String(r.fascia ?? r.Fascia ?? ""), stato: r.stato ?? r.Stato,
+        giustificato: vero(r.giustificato ?? r.Giustificato),
+        uscita: r.uscita === null || r.uscita === "" ? null : num(r.uscita, null),
+        uscita_ok: vero(r.uscita_ok) }))
+        .filter(p => p.data && HOURS.includes(p.fascia) && ["presente","assente","ritardo"].includes(p.stato));
+
+      const info = foglio("Info")[0] || {};
+      if (!classi.length && !studenti.length && !presenze.length)
+        throw new Error("il file non contiene fogli riconoscibili (Classi, Studenti, Presenze)");
+      setPiano({ classi, studenti, iscrizioni, orari, presenze, nomeFile: file.name,
+        vecchio: !info.formato, parziale: !foglio("Presenze").some(r=>"uscita_ok" in r) });
+    } catch (e) { setErr("File non leggibile: " + (e.message||"")); }
+  };
+
+  const applicaBackup = async () => {
+    if (!piano) return;
+    setErr(null); setMsg(null); setRsBusy(true); setAvanz("");
+    const blocchi = async (etichetta, path, righe) => {
+      const step = 500;
+      for (let i = 0; i < righe.length; i += step) {
+        setAvanz(`${etichetta}: ${Math.min(i+step, righe.length)} di ${righe.length}…`);
+        await api(path, { method: "POST", headers: WRITE, body: JSON.stringify(righe.slice(i, i+step)) });
+      }
+    };
+    try {
+      // L'ordine non è casuale: iscrizioni, orari e presenze puntano a classi
+      // e studenti, che devono quindi esistere prima.
+      await blocchi("Classi", "classi?on_conflict=id", piano.classi);
+      await blocchi("Studenti", "studenti?on_conflict=id", piano.studenti);
+      await blocchi("Iscrizioni", "iscrizioni?on_conflict=studente_id,classe_id", piano.iscrizioni);
+      await blocchi("Orari", "orari?on_conflict=studente_id,giorno", piano.orari);
+      await blocchi("Presenze", "presenze?on_conflict=studente_id,data,fascia", piano.presenze);
+      setAvanz("");
+      setMsg(`Ripristino completato: ${piano.classi.length} classi, ${piano.studenti.length} studenti, ${piano.presenze.length} registrazioni riallineate.`);
+      setPiano(null);
+      if (onReload) onReload();
+    } catch (e) {
+      setErr("Ripristino interrotto: " + (e.message||"") + ". I dati già scritti restano validi; puoi rilanciare il ripristino con lo stesso file.");
+    } finally { setRsBusy(false); }
   };
 
   const lbl = {fontSize:12,color:"var(--color-text-tertiary)",textTransform:"uppercase",letterSpacing:"0.05em",marginBottom:6};
@@ -1589,6 +1710,45 @@ ${inner}
           {bkBusy?"Backup in corso…":"Scarica backup completo"}
         </button>
         {msg && <div style={{fontSize:12,color:"var(--color-text-secondary)",marginTop:10,padding:"9px 12px",background:"var(--color-background-secondary)",borderRadius:"var(--border-radius-md)",border:"0.5px solid var(--color-border-secondary)"}}>{msg}</div>}
+      </div>
+
+      <div style={{marginTop:28,paddingTop:20,borderTop:"0.5px solid var(--color-border-tertiary)"}}>
+        <div style={lbl}>Ripristino da backup</div>
+        <div style={{fontSize:13,color:"var(--color-text-secondary)",marginBottom:12,lineHeight:1.5}}>
+          Rimette nell'archivio le righe contenute in un file di backup. È un ripristino <strong>integrativo</strong>: ciò che è stato cancellato torna, ciò che esiste viene riallineato al file, e ciò che è stato inserito dopo il backup <strong>non</strong> viene toccato. Non riporta quindi il registro indietro nel tempo.
+        </div>
+        {!piano && !rsBusy && (
+          <label style={{fontSize:14,padding:"9px 16px",borderRadius:"var(--border-radius-md)",cursor:"pointer",border:"0.5px solid var(--color-border-secondary)",background:"transparent",color:"var(--color-text-primary)",fontWeight:500,display:"inline-block"}}>
+            Scegli un file di backup…
+            <input type="file" accept=".xlsx" style={{display:"none"}}
+              onChange={e=>{ const f=e.target.files&&e.target.files[0]; e.target.value=""; if(f) leggiBackup(f); }} />
+          </label>
+        )}
+        {rsBusy && (
+          <div style={{fontSize:13,color:"var(--color-text-secondary)",padding:"10px 12px",background:"var(--color-background-secondary)",borderRadius:"var(--border-radius-md)"}}>
+            Ripristino in corso — non chiudere la pagina.{avanz && <div style={{marginTop:4,fontSize:12,color:"var(--color-text-tertiary)"}}>{avanz}</div>}
+          </div>
+        )}
+        {piano && !rsBusy && (
+          <div style={{padding:"12px 14px",background:"var(--color-background-secondary)",borderRadius:"var(--border-radius-md)",border:"0.5px solid var(--color-border-secondary)"}}>
+            <div style={{fontSize:13,fontWeight:500,marginBottom:8}}>{piano.nomeFile}</div>
+            <div style={{fontSize:13,color:"var(--color-text-secondary)",lineHeight:1.7,marginBottom:10}}>
+              {piano.classi.length} classi · {piano.studenti.length} studenti · {piano.iscrizioni.length} iscrizioni<br/>
+              {piano.orari.length} orari · <strong>{piano.presenze.length} registrazioni di presenza</strong>
+            </div>
+            {piano.vecchio && (
+              <div style={{fontSize:12,color:"#854F0B",background:"#FAEEDA",border:"0.5px solid #EF9F27",borderRadius:"var(--border-radius-md)",padding:"8px 10px",marginBottom:10,lineHeight:1.45}}>
+                Backup in <strong>formato precedente</strong>: non contiene colori delle classi, note, ore di ingresso e uscite anticipate. Quei valori verranno azzerati sulle righe ripristinate. Se nel registro attuale sono corretti, annulla e scarica prima un backup aggiornato.
+              </div>
+            )}
+            <div style={{display:"flex",gap:8}}>
+              <button onClick={applicaBackup}
+                style={{fontSize:14,padding:"9px 16px",borderRadius:"var(--border-radius-md)",cursor:"pointer",border:"none",background:"#1F3864",color:"#fff",fontWeight:500}}>Ripristina</button>
+              <button onClick={()=>setPiano(null)}
+                style={{fontSize:14,padding:"9px 16px",borderRadius:"var(--border-radius-md)",cursor:"pointer",border:"0.5px solid var(--color-border-secondary)",background:"transparent",color:"var(--color-text-primary)"}}>Annulla</button>
+            </div>
+          </div>
+        )}
       </div>
     </div>
   );
