@@ -245,7 +245,12 @@ function analizza(rows, orari, sid) {
   let pr=0, as=0, ri=0, gi=0, usc=0, uscNo=0;
   const giorniAss = [];
   const oreParziali = [];
+  // Una registrazione su un'ora che l'orario dello studente non prevede non è
+  // un'assenza: può restare in archivio dopo una modifica d'orario, o nascere
+  // da un errore. Viene ignorata ovunque, nei totali come negli elenchi.
+  const previsto = (r) => fasceGiorno(orari, sid, r.data).fasce.includes(r.fascia);
   rows.forEach(r => {
+    if (!previsto(r)) return;
     if (r.stato==='presente') pr++; else if (r.stato==='assente') as++; else if (r.stato==='ritardo') ri++;
     if (r.giustificato && (r.stato==='assente' || r.stato==='ritardo')) gi++;
     // Le uscite programmate nell'orario non finiscono qui: sono note in anticipo
@@ -261,7 +266,7 @@ function analizza(rows, orari, sid) {
     if (interoGiorno) {
       giorniAss.push({ data: d, ore, giustificato: assenti.every(r => r.giustificato) });
     } else {
-      rs.filter(r => r.stato === 'assente' || r.stato === 'ritardo')
+      rs.filter(r => fasce.includes(r.fascia) && (r.stato === 'assente' || r.stato === 'ritardo'))
         .sort((a,b) => HOURS.indexOf(a.fascia) - HOURS.indexOf(b.fascia))
         .forEach(r => oreParziali.push({ data: d, fascia: r.fascia, stato: r.stato, giustificato: r.giustificato }));
     }
@@ -584,7 +589,7 @@ function Registro({ ruolo, onLogout }) {
         // stato la segnalazione decade, altrimenti resterebbe appesa a un'assenza.
         const saved = await api("presenze?on_conflict=studente_id,data,fascia", {
           method: "POST", headers: WRITE_BACK,
-          body: JSON.stringify({ studente_id: sid, data: date, fascia: h, stato: next, giustificato: false, uscita: next==='presente' ? (existing?.uscita ?? null) : null }),
+          body: JSON.stringify({ studente_id: sid, data: date, fascia: h, stato: next, giustificato: false, uscita: next==='presente' ? (existing?.uscita ?? null) : null, uscita_ok: next==='presente' ? !!(existing?.uscita_ok) : false }),
         });
         mergeLocal(saved || []);
       }
@@ -601,7 +606,7 @@ function Registro({ ruolo, onLogout }) {
     try {
       const saved = await api("presenze?on_conflict=studente_id,data,fascia", {
         method: "POST", headers: WRITE_BACK,
-        body: JSON.stringify(fasce.map(h => ({ studente_id: sid, data: date, fascia: h, stato: status, giustificato: false, uscita: status==='presente' ? (presKey(sid,h)?.uscita ?? null) : null }))),
+        body: JSON.stringify(fasce.map(h => ({ studente_id: sid, data: date, fascia: h, stato: status, giustificato: false, uscita: status==='presente' ? (presKey(sid,h)?.uscita ?? null) : null, uscita_ok: status==='presente' ? !!(presKey(sid,h)?.uscita_ok) : false }))),
       });
       mergeLocal(saved || []);
     } catch (e) { handleErr(e); loadPresenze(); }
@@ -628,8 +633,8 @@ function Registro({ ruolo, onLogout }) {
     }
 
     const righe = [
-      { studente_id: sid, data: date, fascia: h, stato: existing.stato, giustificato: attiva, uscita: existing.uscita ?? null },
-      ...seguenti.map(x => ({ studente_id: sid, data: date, fascia: x, stato: 'assente', giustificato: true, uscita: null })),
+      { studente_id: sid, data: date, fascia: h, stato: existing.stato, giustificato: attiva, uscita: existing.uscita ?? null, uscita_ok: !!existing.uscita_ok },
+      ...seguenti.map(x => ({ studente_id: sid, data: date, fascia: x, stato: 'assente', giustificato: true, uscita: null, uscita_ok: false })),
     ];
     try {
       const saved = await api("presenze?on_conflict=studente_id,data,fascia", {
@@ -649,7 +654,7 @@ function Registro({ ruolo, onLogout }) {
     try {
       const saved = await api("presenze?on_conflict=studente_id,data,fascia", {
         method: "POST", headers: WRITE_BACK,
-        body: JSON.stringify(rows.map(r => ({ studente_id: sid, data: date, fascia: r.fascia, stato: r.stato, giustificato: newVal, uscita: r.uscita ?? null }))),
+        body: JSON.stringify(rows.map(r => ({ studente_id: sid, data: date, fascia: r.fascia, stato: r.stato, giustificato: newVal, uscita: r.uscita ?? null, uscita_ok: !!r.uscita_ok }))),
       });
       mergeLocal(saved || []);
       say(newVal ? "Giornata giustificata." : "Giustificazione rimossa.");
@@ -756,12 +761,16 @@ function Registro({ ruolo, onLogout }) {
   // ok = autorizzata per quel giorno; solo la segreteria può dichiararlo.
   const setUscita = async (sid, h, min, ok) => {
     const existing = presKey(sid, h);
-    if (!existing || existing.stato !== 'presente') return;
-    if (!isSegreteria && h !== ultimaFascia(sid)) return;
+    // Il docente constata un fatto, quindi può segnalare solo su chi ha già
+    // segnato presente, e solo sull'ultima ora. La segreteria invece registra
+    // una comunicazione della famiglia, che può arrivare prima della lezione:
+    // se la casella è ancora vuota viene creata come presente.
+    if (!isSegreteria && (!existing || existing.stato !== 'presente' || h !== ultimaFascia(sid))) return;
+    const stato = existing && existing.stato ? existing.stato : 'presente';
     try {
       const saved = await api("presenze?on_conflict=studente_id,data,fascia", {
         method: "POST", headers: WRITE_BACK,
-        body: JSON.stringify({ studente_id: sid, data: date, fascia: h, stato: 'presente', giustificato: !!existing.giustificato,
+        body: JSON.stringify({ studente_id: sid, data: date, fascia: h, stato, giustificato: !!(existing && existing.giustificato),
           uscita: min, uscita_ok: min ? (isSegreteria ? !!ok : false) : false }),
       });
       mergeLocal(saved || []);
@@ -817,7 +826,7 @@ function Registro({ ruolo, onLogout }) {
     const ok = !!(pres && pres.uscita_ok);
     const fissa = uscitaFissa(sid);
     const fissaQui = fissa && fissa.fascia === h ? fissa.min : 0;
-    const modificabile = state === 'presente' && (isSegreteria || (!motivoBlocco(h) && h === ultimaFascia(sid)));
+    const modificabile = isSegreteria || (state === 'presente' && !motivoBlocco(h) && h === ultimaFascia(sid));
     if (!segn && !fissaQui && !modificabile) return null;
     const c = segn ? (ok ? C_USC_OK : C_USC_SEGN) : C_USC_FISSA;
     const val = segn || fissaQui;
@@ -864,7 +873,7 @@ function Registro({ ruolo, onLogout }) {
         <div style={{fontSize:12,color:"var(--color-text-secondary)",marginBottom:10}}>A che ora è uscito? Gli orari sono arrotondati ai cinque minuti.</div>
         <div style={{display:"grid",gridTemplateColumns:"repeat(3,1fr)",gap:6,marginBottom:12}}>
           {USCITE.map(m=>(
-            <button key={m} onClick={()=>setUscita(sid,h,m,ok)}
+            <button key={m} onClick={()=>setUscita(sid,h,m, attuale ? ok : isSegreteria)}
               style={{...b,padding:"9px 4px",textAlign:"center",fontWeight:attuale===m?600:400,
                 background:attuale===m?(ok?C_USC_OK.bg:C_USC_SEGN.bg):"transparent",
                 borderColor:attuale===m?(ok?C_USC_OK.bd:C_USC_SEGN.bd):"var(--color-border-secondary)",
@@ -873,6 +882,11 @@ function Registro({ ruolo, onLogout }) {
             </button>
           ))}
         </div>
+        {isSegreteria && !(pres && pres.stato) && (
+          <div style={{fontSize:11,color:"#1F3864",background:"#E7F0F9",border:"0.5px solid #2E75B5",borderRadius:"var(--border-radius-md)",padding:"8px 10px",marginBottom:12,lineHeight:1.45}}>
+            La casella è ancora vuota: scegliendo un orario verrà segnata <strong>presente</strong> con l'uscita anticipata già autorizzata. Il docente potrà comunque correggerla.
+          </div>
+        )}
         {isSegreteria ? (
           <div style={{marginBottom:12}}>
             <div style={{fontSize:12,color:"var(--color-text-secondary)",marginBottom:6}}>Per oggi questa uscita è:</div>
@@ -1388,7 +1402,7 @@ function StatsView({ cls, clsStudents, date, orari }) {
               <th style={{...th,textAlign:"center"}}>di cui giustif.</th>
               <th style={{...th,textAlign:"center"}}>Giorni assenza</th>
               <th style={{...th,textAlign:"center"}}>Giorni giustif.</th>
-              <th style={{...th,textAlign:"center"}}>Uscite anticip.</th>
+              <th style={{...th,textAlign:"center"}}>Uscite non autoriz.</th>
             </tr>
           </thead>
           <tbody>
@@ -1403,8 +1417,9 @@ function StatsView({ cls, clsStudents, date, orari }) {
                 <td style={{textAlign:"center",fontSize:14,color:"#3B6D11",fontWeight:500}}>{s.gi}</td>
                 <td style={{textAlign:"center",fontSize:14,color:"#A32D2D",fontWeight:500}}>{s.gAss}</td>
                 <td style={{textAlign:"center",fontSize:14,color:"#3B6D11",fontWeight:500}}>{s.gGiust}</td>
-                <td style={{textAlign:"center",fontSize:14,fontWeight:500,color:s.uscNo>0?"#8F2D22":"var(--color-text-tertiary)"}}>
-                  {s.uscNo}{s.usc>s.uscNo && <span style={{fontSize:11,fontWeight:400,color:"var(--color-text-tertiary)"}}> su {s.usc}</span>}
+                <td title={s.usc===0 ? "Nessuna uscita anticipata rilevata" : `${s.usc} ${s.usc===1?"uscita rilevata":"uscite rilevate"}, ${s.usc-s.uscNo} con autorizzazione`}
+                  style={{textAlign:"center",fontSize:14,fontWeight:500,color:s.uscNo>0?"#8F2D22":"var(--color-text-tertiary)"}}>
+                  {s.uscNo}
                 </td>
               </tr>
             ))}
@@ -1413,7 +1428,7 @@ function StatsView({ cls, clsStudents, date, orari }) {
       </div>
       <div style={{fontSize:11,color:"var(--color-text-tertiary)",marginTop:8}}>
         Un <strong>giorno di assenza</strong> è conteggiato quando lo studente risulta assente in tutte le ore previste dal suo orario per quel giorno.
-        Le <strong>uscite anticipate</strong> riportano quelle non autorizzate sul totale di quelle rilevate: le uscite programmate nell'orario non sono conteggiate, perché già concordate con la segreteria.
+        La colonna <strong>uscite non autorizzate</strong> conta solo quelle rilevate sul momento e mai approvate dalla segreteria: restano fuori sia le uscite programmate nell'orario sia quelle autorizzate caso per caso, perché già concordate con le famiglie.
       </div>
     </React.Fragment>
   );
